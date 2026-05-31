@@ -8,13 +8,21 @@ from mail_pipeline import notmuch
 
 
 def test_index_mail_invokes_notmuch_new():
-    with patch("mail_pipeline.notmuch.subprocess.run") as mock_run:
-        notmuch.index_mail("/config/notmuch-config")
+    completed = MagicMock(stdout="No new mail.\n")
+    with patch("mail_pipeline.notmuch.subprocess.run", return_value=completed) as mock_run:
+        result = notmuch.index_mail("/config/notmuch-config")
 
     args, kwargs = mock_run.call_args
     assert args[0] == ["notmuch", "new"]
     assert kwargs["check"] is True
     assert kwargs["env"]["NOTMUCH_CONFIG"] == "/config/notmuch-config"
+    assert result == 0
+
+
+def test_index_mail_returns_added_count():
+    completed = MagicMock(stdout="Added 5 new messages to database.\n")
+    with patch("mail_pipeline.notmuch.subprocess.run", return_value=completed):
+        assert notmuch.index_mail("/config/notmuch-config") == 5
 
 
 def test_search_message_ids_returns_lines():
