@@ -29,9 +29,9 @@ def test_mail_flow_runs_all_tasks_in_order(monkeypatch):
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
         mock_mbsync.run_mbsync.side_effect = lambda *a, **kw: call_order.append("sync")
-        mock_notmuch.index_mail.side_effect = lambda *a, **kw: call_order.append("index")
-        mock_extract.extract_pdfs.side_effect = lambda **kw: (call_order.append("extract"), 0)[1]
-        mock_metrics.push_success_metric.side_effect = lambda: call_order.append("push")
+        mock_notmuch.index_mail.side_effect = lambda *a, **kw: (call_order.append("index"), 3)[1]
+        mock_extract.extract_pdfs.side_effect = lambda **kw: (call_order.append("extract"), 1)[1]
+        mock_metrics.push_run_metrics.side_effect = lambda *a, **kw: call_order.append("push")
 
         mail_flow()
 
@@ -53,4 +53,4 @@ def test_mail_flow_skipped_when_pipeline_busy():
         mock_mbsync.run_mbsync.assert_not_called()
         mock_notmuch.index_mail.assert_not_called()
         mock_extract.extract_pdfs.assert_not_called()
-        mock_metrics.push_success_metric.assert_not_called()
+        mock_metrics.push_run_metrics.assert_not_called()

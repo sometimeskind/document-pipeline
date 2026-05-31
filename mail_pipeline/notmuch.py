@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -14,8 +15,8 @@ def _env(notmuch_config: str) -> dict[str, str]:
     return {**os.environ, "NOTMUCH_CONFIG": notmuch_config}
 
 
-def index_mail(notmuch_config: str) -> None:
-    """Run `notmuch new` to index any newly synced messages."""
+def index_mail(notmuch_config: str) -> int:
+    """Run `notmuch new` and return the number of newly indexed messages."""
     started = time.perf_counter()
     result = subprocess.run(
         ["notmuch", "new"],
@@ -28,6 +29,9 @@ def index_mail(notmuch_config: str) -> None:
         logger.info("notmuch new (%.2fs): %s", elapsed, output.replace("\n", " | "))
     else:
         logger.info("notmuch new finished in %.2fs (no output)", elapsed)
+
+    m = re.search(r"Added (\d+)", output)
+    return int(m.group(1)) if m else 0
 
 
 def search_message_ids(query: str, notmuch_config: str) -> list[str]:
