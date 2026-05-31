@@ -11,7 +11,7 @@ from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 
 logger = logging.getLogger(__name__)
 
-_PREFECT_FILTER_URL = "{url}/api/flow_runs/filter"
+_PREFECT_FILTER_URL = "{url}/flow_runs/filter"
 _PREFECT_FILTER_BODY = {
     "flow_runs": {
         "state": {"type": {"any_": ["FAILED", "CRASHED"]}},
