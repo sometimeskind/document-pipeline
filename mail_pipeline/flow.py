@@ -28,15 +28,16 @@ def sync_mail_task() -> None:
 
 
 @task(name="index-mail", log_prints=True)
-def index_mail_task() -> None:
+def index_mail_task() -> int:
     logger = get_run_logger()
     started = time.perf_counter()
-    notmuch.index_mail(_notmuch_config())
-    logger.info("index-mail complete in %.2fs", time.perf_counter() - started)
+    emails_synced = notmuch.index_mail(_notmuch_config())
+    logger.info("index-mail complete in %.2fs: %d new message(s)", time.perf_counter() - started, emails_synced)
+    return emails_synced
 
 
 @task(name="extract-pdfs", log_prints=True)
-def extract_pdfs_task() -> None:
+def extract_pdfs_task() -> int:
     logger = get_run_logger()
     started = time.perf_counter()
     submitted = extract.extract_pdfs(
@@ -48,11 +49,12 @@ def extract_pdfs_task() -> None:
         "extract-pdfs complete in %.2fs: tagged %d message(s) as +paperless",
         time.perf_counter() - started, submitted,
     )
+    return submitted
 
 
 @task(name="push-metrics", log_prints=True)
-def push_metrics_task() -> None:
-    metrics.push_success_metric()
+def push_metrics_task(emails_synced: int, pdfs_submitted: int, duration_seconds: float) -> None:
+    metrics.push_run_metrics(emails_synced, pdfs_submitted, duration_seconds)
 
 
 @flow(name="mail", log_prints=True)
@@ -62,9 +64,9 @@ def mail_flow() -> None:
     try:
         with concurrency("mail-pipeline", occupy=1, timeout_seconds=10):
             sync_mail_task()
-            index_mail_task()
-            extract_pdfs_task()
-            push_metrics_task()
+            emails_synced = index_mail_task()
+            pdfs_submitted = extract_pdfs_task()
+            push_metrics_task(emails_synced, pdfs_submitted, time.perf_counter() - flow_started)
         logger.info("mail flow complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
         logger.info("Skipped — mail pipeline already running")
