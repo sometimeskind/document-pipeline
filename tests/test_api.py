@@ -41,3 +41,28 @@ def test_sync_trigger_returns_503_when_prefect_unreachable(client):
     with patch("mail_pipeline.prefect_client.trigger_sync", return_value=False):
         resp = client.post("/sync/trigger", headers=AUTH)
     assert resp.status_code == 503
+
+
+def test_trigger_flow_returns_200_when_no_active_run(client):
+    with patch("mail_pipeline.prefect_client.has_active_run", return_value=False), \
+         patch("mail_pipeline.prefect_client.trigger_sync", return_value=True):
+        resp = client.post("/trigger-flow", headers=AUTH)
+    assert resp.status_code == 200
+
+
+def test_trigger_flow_returns_202_when_run_already_in_flight(client):
+    with patch("mail_pipeline.prefect_client.has_active_run", return_value=True):
+        resp = client.post("/trigger-flow", headers=AUTH)
+    assert resp.status_code == 202
+
+
+def test_trigger_flow_returns_401_without_auth(client):
+    resp = client.post("/trigger-flow")
+    assert resp.status_code == 401
+
+
+def test_trigger_flow_returns_503_when_prefect_fails(client):
+    with patch("mail_pipeline.prefect_client.has_active_run", return_value=False), \
+         patch("mail_pipeline.prefect_client.trigger_sync", return_value=False):
+        resp = client.post("/trigger-flow", headers=AUTH)
+    assert resp.status_code == 503

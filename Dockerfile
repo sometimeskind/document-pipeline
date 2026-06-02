@@ -2,14 +2,14 @@ FROM python:3.14-slim AS prod
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      isync notmuch ca-certificates \
+      ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY mail_pipeline/ /build/mail_pipeline/
 COPY pyproject.toml requirements.txt /build/
 RUN pip install --no-cache-dir -r /build/requirements.txt /build
 
-RUN mkdir -p /maildir /state /config /secrets
+RUN mkdir -p /state /config /secrets
 
 EXPOSE 8080
 CMD ["python", "-m", "mail_pipeline"]

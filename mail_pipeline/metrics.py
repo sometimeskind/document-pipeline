@@ -64,7 +64,7 @@ def push_run_metrics(
     ).set(time.time())
     Gauge(
         "mail_pipeline_emails_synced",
-        "Number of new messages indexed by notmuch in the last run",
+        "Number of new messages processed from IMAP in the last run",
         registry=registry,
     ).set(emails_synced)
     Gauge(
