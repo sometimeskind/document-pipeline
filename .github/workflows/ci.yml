@@ -76,11 +76,5 @@ jobs:
           IMAGE_ID: ${{ steps.build.outputs.imageid }}
         run: docker tag "$IMAGE_ID" mail-pipeline:ci-local
 
-      - name: Health check — mbsync
-        run: docker run --rm --entrypoint mbsync mail-pipeline:ci-local --version
-
-      - name: Health check — notmuch
-        run: docker run --rm --entrypoint notmuch mail-pipeline:ci-local --version
-
       - name: Health check — flow imports
         run: docker run --rm --entrypoint python mail-pipeline:ci-local -c "from mail_pipeline.flow import mail_flow; print(mail_flow.name)"

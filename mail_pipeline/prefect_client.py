@@ -23,6 +23,33 @@ def trigger_sync() -> bool:
         return False
 
 
+async def _check_active_runs() -> bool:
+    from prefect import get_client
+    from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterState, FlowRunFilterStateType
+    from prefect.client.schemas.objects import StateType
+
+    async with get_client() as client:
+        runs = await client.read_flow_runs(
+            flow_run_filter=FlowRunFilter(
+                state=FlowRunFilterState(
+                    type=FlowRunFilterStateType(
+                        any_=[StateType.RUNNING, StateType.SCHEDULED, StateType.PENDING]
+                    )
+                )
+            )
+        )
+        return bool(runs)
+
+
+def has_active_run() -> bool:
+    """Return True if a mail flow run is already running or queued."""
+    try:
+        return asyncio.run(_check_active_runs())
+    except Exception as exc:
+        logger.warning("Could not check active runs: %s", exc)
+        return False
+
+
 async def _upsert_limits() -> None:
     from prefect import get_client
     async with get_client() as client:

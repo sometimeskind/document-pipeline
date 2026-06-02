@@ -1,1 +1,1 @@
-"""mail-pipeline: Prefect-driven Maildir/notmuch/Paperless integration."""
+"""mail-pipeline: Prefect-driven IMAP/Paperless integration."""

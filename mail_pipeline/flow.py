@@ -8,53 +8,41 @@ import time
 from prefect import flow, get_run_logger, task
 from prefect.concurrency.sync import concurrency
 
-from mail_pipeline import extract, mbsync, metrics, notmuch
+from mail_pipeline import extract, imap_client, metrics
 
 
-def _notmuch_config() -> str:
-    return os.environ.get("NOTMUCH_CONFIG", "/config/notmuch-config")
+@task(name="process-mail", log_prints=True)
+def process_mail_task() -> tuple[int, int]:
+    """Fetch unprocessed messages from IMAP, submit PDFs, mark processed.
 
-
-def _mbsync_config() -> str:
-    return os.environ.get("MBSYNC_CONFIG", "/config/mbsyncrc")
-
-
-@task(name="sync-mail", log_prints=True)
-def sync_mail_task() -> None:
+    Returns (messages_processed, pdfs_submitted).
+    """
     logger = get_run_logger()
     started = time.perf_counter()
-    mbsync.run_mbsync(_mbsync_config())
-    logger.info("sync-mail complete in %.2fs", time.perf_counter() - started)
 
+    with imap_client.open_inbox() as conn:
+        messages = imap_client.fetch_unprocessed(conn)
+        logger.info("process-mail: %d unprocessed message(s)", len(messages))
+        pdfs_submitted = 0
+        for uid, msg in messages:
+            if extract.submit_message_pdfs(
+                msg,
+                paperless_url=os.environ["PAPERLESS_URL"],
+                paperless_token=os.environ["PAPERLESS_API_TOKEN"],
+            ):
+                pdfs_submitted += 1
+            imap_client.mark_processed(conn, uid)
 
-@task(name="index-mail", log_prints=True)
-def index_mail_task() -> int:
-    logger = get_run_logger()
-    started = time.perf_counter()
-    emails_synced = notmuch.index_mail(_notmuch_config())
-    logger.info("index-mail complete in %.2fs: %d new message(s)", time.perf_counter() - started, emails_synced)
-    return emails_synced
-
-
-@task(name="extract-pdfs", log_prints=True)
-def extract_pdfs_task() -> int:
-    logger = get_run_logger()
-    started = time.perf_counter()
-    submitted = extract.extract_pdfs(
-        notmuch_config=_notmuch_config(),
-        paperless_url=os.environ["PAPERLESS_URL"],
-        paperless_token=os.environ["PAPERLESS_API_TOKEN"],
-    )
     logger.info(
-        "extract-pdfs complete in %.2fs: tagged %d message(s) as +paperless",
-        time.perf_counter() - started, submitted,
+        "process-mail complete in %.2fs: %d message(s), %d PDF(s) submitted",
+        time.perf_counter() - started, len(messages), pdfs_submitted,
     )
-    return submitted
+    return len(messages), pdfs_submitted
 
 
 @task(name="push-metrics", log_prints=True)
-def push_metrics_task(emails_synced: int, pdfs_submitted: int, duration_seconds: float) -> None:
-    metrics.push_run_metrics(emails_synced, pdfs_submitted, duration_seconds)
+def push_metrics_task(messages_processed: int, pdfs_submitted: int, duration_seconds: float) -> None:
+    metrics.push_run_metrics(messages_processed, pdfs_submitted, duration_seconds)
 
 
 @flow(name="mail", log_prints=True)
@@ -63,10 +51,8 @@ def mail_flow() -> None:
     flow_started = time.perf_counter()
     try:
         with concurrency("mail-pipeline", occupy=1, timeout_seconds=10):
-            sync_mail_task()
-            emails_synced = index_mail_task()
-            pdfs_submitted = extract_pdfs_task()
-            push_metrics_task(emails_synced, pdfs_submitted, time.perf_counter() - flow_started)
+            messages_processed, pdfs_submitted = process_mail_task()
+            push_metrics_task(messages_processed, pdfs_submitted, time.perf_counter() - flow_started)
         logger.info("mail flow complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
         logger.info("Skipped — mail pipeline already running")
