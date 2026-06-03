@@ -73,6 +73,22 @@ def test_mail_flow_marks_message_processed_even_without_pdf(monkeypatch):
     mock_imap.mark_processed.assert_called_once_with(mock_conn, b"5")
 
 
+def test_mail_flow_propagates_imap_timeout():
+    """An IMAP connection timeout inside the flow body must not be silently swallowed."""
+    from mail_pipeline.flow import mail_flow
+    import pytest
+    with patch("mail_pipeline.flow.concurrency") as mock_concurrency, \
+         patch("mail_pipeline.flow.imap_client") as mock_imap, \
+         patch("mail_pipeline.flow.extract"), \
+         patch("mail_pipeline.flow.metrics"):
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_imap.open_inbox.return_value.__enter__.side_effect = TimeoutError(110, "Connection timed out")
+
+        with pytest.raises(TimeoutError):
+            mail_flow()
+
+
 def test_mail_flow_skipped_when_pipeline_busy():
     from mail_pipeline.flow import mail_flow
     with patch("mail_pipeline.flow.concurrency") as mock_concurrency, \
