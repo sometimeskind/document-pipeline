@@ -49,10 +49,15 @@ def push_metrics_task(messages_processed: int, pdfs_submitted: int, duration_sec
 def mail_flow() -> None:
     logger = get_run_logger()
     flow_started = time.perf_counter()
+    slot_acquired = False
     try:
         with concurrency("mail-pipeline", occupy=1, timeout_seconds=10):
+            slot_acquired = True
             messages_processed, pdfs_submitted = process_mail_task()
             push_metrics_task(messages_processed, pdfs_submitted, time.perf_counter() - flow_started)
         logger.info("mail flow complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
-        logger.info("Skipped — mail pipeline already running")
+        if not slot_acquired:
+            logger.info("Skipped — mail pipeline already running")
+        else:
+            raise
