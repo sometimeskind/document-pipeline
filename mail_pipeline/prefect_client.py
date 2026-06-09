@@ -25,18 +25,30 @@ def trigger_sync() -> bool:
 
 async def _check_active_runs() -> bool:
     from prefect import get_client
-    from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterState, FlowRunFilterStateType
+    from prefect.client.schemas.filters import (
+        DeploymentFilter,
+        DeploymentFilterName,
+        FlowRunFilter,
+        FlowRunFilterState,
+        FlowRunFilterStateType,
+    )
     from prefect.client.schemas.objects import StateType
 
+    # Scope by deployment name so unrelated deployments (e.g. a daily-cron
+    # deployment that always has SCHEDULED future runs queued) don't block
+    # our trigger. RUNNING/PENDING only — SCHEDULED runs are by definition
+    # future and don't conflict with starting one now; Prefect's own
+    # concurrency limit on the `mail` flow is the last line of defense.
     async with get_client() as client:
         runs = await client.read_flow_runs(
+            deployment_filter=DeploymentFilter(name=DeploymentFilterName(any_=["mail"])),
             flow_run_filter=FlowRunFilter(
                 state=FlowRunFilterState(
                     type=FlowRunFilterStateType(
-                        any_=[StateType.RUNNING, StateType.SCHEDULED, StateType.PENDING]
+                        any_=[StateType.RUNNING, StateType.PENDING]
                     )
                 )
-            )
+            ),
         )
         return bool(runs)
 
