@@ -62,6 +62,23 @@ def has_active_run() -> bool:
         return False
 
 
+async def _clear_schedules() -> None:
+    from prefect import get_client
+    async with get_client() as client:
+        deployment = await client.read_deployment_by_name("mail/mail")
+        for schedule in deployment.schedules:
+            await client.delete_deployment_schedule(deployment.id, schedule.id)
+            logger.info("Cleared stale deployment schedule: %s", schedule.id)
+
+
+def clear_deployment_schedules() -> None:
+    """Remove any cron schedules persisted in the Prefect DB for this deployment."""
+    try:
+        asyncio.run(_clear_schedules())
+    except Exception as exc:
+        logger.warning("Could not clear deployment schedules: %s", exc)
+
+
 async def _upsert_limits() -> None:
     from prefect import get_client
     async with get_client() as client:
