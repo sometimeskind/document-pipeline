@@ -46,6 +46,10 @@ def main() -> None:
 
     ensure_concurrency_limits()
 
+    if not fetch_cron:
+        from mail_pipeline.prefect_client import clear_deployment_schedules
+        clear_deployment_schedules()
+
     deployment = mail_flow.to_deployment(name="mail", cron=fetch_cron)
 
     logger.info("Starting Prefect runner (FETCH_CRON=%s)", fetch_cron or "disabled")
