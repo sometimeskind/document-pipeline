@@ -63,12 +63,22 @@ def has_active_run() -> bool:
 
 
 async def _clear_schedules() -> None:
-    from prefect import get_client
-    async with get_client() as client:
-        deployment = await client.read_deployment_by_name("mail/mail")
-        for schedule in deployment.schedules:
-            await client.delete_deployment_schedule(deployment.id, schedule.id)
-            logger.info("Cleared stale deployment schedule: %s", schedule.id)
+    import os
+    import httpx
+    api = os.environ.get("PREFECT_API_URL", "http://prefect-server.prefect.svc.cluster.local:4200/api")
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(f"{api}/deployments/name/mail/mail")
+        resp.raise_for_status()
+        dep = resp.json()
+        dep_id = dep["id"]
+        # Clear new-style schedules list
+        for s in dep.get("schedules") or []:
+            await http.delete(f"{api}/deployments/{dep_id}/schedules/{s['id']}")
+            logger.info("Cleared stale deployment schedule: %s", s["id"])
+        # Clear legacy single-schedule field if present
+        if dep.get("schedule"):
+            await http.patch(f"{api}/deployments/{dep_id}", json={"schedule": None})
+            logger.info("Cleared stale legacy deployment schedule")
 
 
 def clear_deployment_schedules() -> None:
