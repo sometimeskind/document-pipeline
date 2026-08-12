@@ -11,7 +11,7 @@ dependencies = [
     "flask>=3.0",
     "waitress>=3.0",
     "httpx>=0.27",
-    "prometheus-client>=0.20",
+    "prometheus-client>=0.26.0",
 ]
 
 [tool.setuptools.packages.find]
