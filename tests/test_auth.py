@@ -1,4 +1,4 @@
-"""Tests for mail_pipeline.auth — bearer-token middleware."""
+"""Tests for document_pipeline.auth — bearer-token middleware."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from mail_pipeline.api import create_app
+from document_pipeline.api import create_app
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def test_sync_trigger_wrong_token_returns_401(client):
 
 
 def test_sync_trigger_correct_token_returns_202(client):
-    with patch("mail_pipeline.prefect_client.trigger_sync", return_value=True):
+    with patch("document_pipeline.prefect_client.trigger_sync", return_value=True):
         resp = client.post(
             "/sync/trigger",
             headers={"Authorization": "Bearer test-secret"},

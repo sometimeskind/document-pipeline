@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from mail_pipeline.webdav import WebDAVClient, WebDAVEntry
+from document_pipeline.webdav import WebDAVClient, WebDAVEntry
 
 logger = logging.getLogger(__name__)
 

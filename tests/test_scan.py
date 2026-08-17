@@ -1,4 +1,4 @@
-"""Tests for mail_pipeline.scan — the delete-only-when-really-ingested contract."""
+"""Tests for document_pipeline.scan — the delete-only-when-really-ingested contract."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ import httpx
 import pytest
 import respx
 
-from mail_pipeline import scan
-from mail_pipeline.webdav import WebDAVClient, WebDAVEntry
+from document_pipeline import scan
+from document_pipeline.webdav import WebDAVClient, WebDAVEntry
 
 
 PAPERLESS = "http://paperless"

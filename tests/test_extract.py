@@ -1,4 +1,4 @@
-"""Tests for mail_pipeline.extract — PDF extraction and Paperless submission."""
+"""Tests for document_pipeline.extract — PDF extraction and Paperless submission."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from email.message import EmailMessage
 import httpx
 import respx
 
-from mail_pipeline import extract
+from document_pipeline import extract
 
 
 def _pdf_message() -> EmailMessage:

@@ -1,4 +1,4 @@
-"""Entry point: mail-pipeline service."""
+"""Entry point: document-pipeline service."""
 
 from __future__ import annotations
 
@@ -40,9 +40,9 @@ def main() -> None:
     from prefect import serve as prefect_serve
 
     import waitress
-    from mail_pipeline.api import create_app
-    from mail_pipeline.flow import mail_flow, scan_flow
-    from mail_pipeline.prefect_client import ensure_concurrency_limits
+    from document_pipeline.api import create_app
+    from document_pipeline.flow import mail_flow, scan_flow
+    from document_pipeline.prefect_client import ensure_concurrency_limits
 
     fetch_cron = os.environ.get("FETCH_CRON")
     scan_enabled = bool(os.environ.get("WEBDAV_URL"))
@@ -60,7 +60,7 @@ def main() -> None:
     ensure_concurrency_limits()
 
     if not fetch_cron:
-        from mail_pipeline.prefect_client import clear_deployment_schedules
+        from document_pipeline.prefect_client import clear_deployment_schedules
         clear_deployment_schedules("mail")
 
     deployments = [mail_flow.to_deployment(name="mail", cron=fetch_cron)]

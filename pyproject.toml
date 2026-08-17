@@ -3,7 +3,7 @@ requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mail-pipeline"
+name = "document-pipeline"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
@@ -17,7 +17,7 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mail_pipeline*"]
+include = ["document_pipeline*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,11 +1,11 @@
-"""Tests for mail_pipeline.imap_client — IMAP fetch and flag operations."""
+"""Tests for document_pipeline.imap_client — IMAP fetch and flag operations."""
 
 from __future__ import annotations
 
 from email.message import EmailMessage
 from unittest.mock import MagicMock, call, patch
 
-from mail_pipeline import imap_client
+from document_pipeline import imap_client
 
 _PROCESSED = "$Processed"
 
@@ -70,7 +70,7 @@ def test_open_inbox_connects_logs_out(monkeypatch):
     monkeypatch.setenv("IMAP_PASSWORD", "secret")
 
     mock_conn = MagicMock()
-    with patch("mail_pipeline.imap_client.imaplib.IMAP4_SSL", return_value=mock_conn):
+    with patch("document_pipeline.imap_client.imaplib.IMAP4_SSL", return_value=mock_conn):
         with imap_client.open_inbox() as conn:
             assert conn is mock_conn
 

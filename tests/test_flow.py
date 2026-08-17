@@ -1,4 +1,4 @@
-"""Tests for mail_pipeline.flow — task wiring and concurrency coalescing."""
+"""Tests for document_pipeline.flow — task wiring and concurrency coalescing."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def _message(subject: str = "Test") -> EmailMessage:
 
 
 def test_mail_flow_processes_messages_and_pushes_metrics(monkeypatch):
-    from mail_pipeline.flow import mail_flow
+    from document_pipeline.flow import mail_flow
     monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
     monkeypatch.setenv("PAPERLESS_API_TOKEN", "tok")
     monkeypatch.setenv("IMAP_PASSWORD", "secret")
@@ -31,10 +31,10 @@ def test_mail_flow_processes_messages_and_pushes_metrics(monkeypatch):
     mock_conn = MagicMock()
     msg = _message()
 
-    with patch("mail_pipeline.flow.imap_client") as mock_imap, \
-         patch("mail_pipeline.flow.extract") as mock_extract, \
-         patch("mail_pipeline.flow.metrics") as mock_metrics, \
-         patch("mail_pipeline.flow.concurrency") as mock_concurrency:
+    with patch("document_pipeline.flow.imap_client") as mock_imap, \
+         patch("document_pipeline.flow.extract") as mock_extract, \
+         patch("document_pipeline.flow.metrics") as mock_metrics, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
         mock_imap.open_inbox.return_value.__enter__.return_value = mock_conn
@@ -50,17 +50,17 @@ def test_mail_flow_processes_messages_and_pushes_metrics(monkeypatch):
 
 
 def test_mail_flow_marks_message_processed_even_without_pdf(monkeypatch):
-    from mail_pipeline.flow import mail_flow
+    from document_pipeline.flow import mail_flow
     monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
     monkeypatch.setenv("PAPERLESS_API_TOKEN", "tok")
     monkeypatch.setenv("IMAP_PASSWORD", "secret")
 
     mock_conn = MagicMock()
 
-    with patch("mail_pipeline.flow.imap_client") as mock_imap, \
-         patch("mail_pipeline.flow.extract") as mock_extract, \
-         patch("mail_pipeline.flow.metrics"), \
-         patch("mail_pipeline.flow.concurrency") as mock_concurrency:
+    with patch("document_pipeline.flow.imap_client") as mock_imap, \
+         patch("document_pipeline.flow.extract") as mock_extract, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
         mock_imap.open_inbox.return_value.__enter__.return_value = mock_conn
@@ -75,12 +75,12 @@ def test_mail_flow_marks_message_processed_even_without_pdf(monkeypatch):
 
 def test_mail_flow_propagates_imap_timeout():
     """An IMAP connection timeout inside the flow body must not be silently swallowed."""
-    from mail_pipeline.flow import mail_flow
+    from document_pipeline.flow import mail_flow
     import pytest
-    with patch("mail_pipeline.flow.concurrency") as mock_concurrency, \
-         patch("mail_pipeline.flow.imap_client") as mock_imap, \
-         patch("mail_pipeline.flow.extract"), \
-         patch("mail_pipeline.flow.metrics"):
+    with patch("document_pipeline.flow.concurrency") as mock_concurrency, \
+         patch("document_pipeline.flow.imap_client") as mock_imap, \
+         patch("document_pipeline.flow.extract"), \
+         patch("document_pipeline.flow.metrics"):
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
         mock_imap.open_inbox.return_value.__enter__.side_effect = TimeoutError(110, "Connection timed out")
@@ -90,11 +90,11 @@ def test_mail_flow_propagates_imap_timeout():
 
 
 def test_mail_flow_skipped_when_pipeline_busy():
-    from mail_pipeline.flow import mail_flow
-    with patch("mail_pipeline.flow.concurrency") as mock_concurrency, \
-         patch("mail_pipeline.flow.imap_client") as mock_imap, \
-         patch("mail_pipeline.flow.extract") as mock_extract, \
-         patch("mail_pipeline.flow.metrics") as mock_metrics:
+    from document_pipeline.flow import mail_flow
+    with patch("document_pipeline.flow.concurrency") as mock_concurrency, \
+         patch("document_pipeline.flow.imap_client") as mock_imap, \
+         patch("document_pipeline.flow.extract") as mock_extract, \
+         patch("document_pipeline.flow.metrics") as mock_metrics:
         mock_concurrency.return_value.__enter__.side_effect = TimeoutError
         mock_concurrency.return_value.__exit__.return_value = False
 

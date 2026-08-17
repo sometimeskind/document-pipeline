@@ -56,22 +56,22 @@ def push_run_metrics(
     registry = CollectorRegistry()
 
     Gauge(
-        "mail_pipeline_last_success_timestamp",
+        "document_pipeline_last_success_timestamp",
         "Unix timestamp of the last successful mail-pipeline run",
         registry=registry,
     ).set(time.time())
     Gauge(
-        "mail_pipeline_emails_synced",
+        "document_pipeline_emails_synced",
         "Number of new messages processed from IMAP in the last run",
         registry=registry,
     ).set(emails_synced)
     Gauge(
-        "mail_pipeline_pdfs_submitted",
+        "document_pipeline_pdfs_submitted",
         "Number of PDFs submitted to Paperless in the last run",
         registry=registry,
     ).set(pdfs_submitted)
     Gauge(
-        "mail_pipeline_run_duration_seconds",
+        "document_pipeline_run_duration_seconds",
         "Total duration of the last successful mail-pipeline run in seconds",
         registry=registry,
     ).set(duration_seconds)
@@ -81,7 +81,7 @@ def push_run_metrics(
         failures = _prefect_failures_24h(prefect_url)
         if failures is not None:
             Gauge(
-                "mail_pipeline_prefect_failures_24h",
+                "document_pipeline_prefect_failures_24h",
                 "Number of failed/crashed mail Prefect flow runs in the last 24 hours",
                 registry=registry,
             ).set(failures)

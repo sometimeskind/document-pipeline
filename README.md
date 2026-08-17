@@ -1,6 +1,6 @@
-# mail-pipeline
+# document-pipeline
 
-Dockerized mail pipeline: Proton Bridge IMAP ↔ `mbsync` ↔ Maildir → `notmuch` index → PDF attachments to Paperless.
+Dockerized document pipeline: PDF attachments from IMAP mail and scanned documents from WebDAV, into Paperless.
 
 ```
 Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IMAP client)
@@ -119,7 +119,7 @@ and whose own suite runs against wsgidav rather than the server we deploy. That
 is the property this pipeline needs: moving to a different WebDAV server should
 be an env repoint, not a code change, and a client tested against a *different*
 server than ours is better evidence of that than fixtures we wrote ourselves.
-`mail_pipeline/webdav.py` is only a thin adapter for the three things the library
+`document_pipeline/webdav.py` is only a thin adapter for the three things the library
 leaves to the caller: entry shape, already-gone resources treated as success, and
 a not-yet-created scan directory treated as an empty one. The tests still run
 every case against two differently-shaped multistatus responses.
@@ -169,15 +169,15 @@ pytest tests/
 Build and run the dev image to exercise tests against the installed `mbsync` and `notmuch`:
 
 ```bash
-docker build --target dev -t mail-pipeline:dev .
-docker run --rm mail-pipeline:dev
+docker build --target dev -t document-pipeline:dev .
+docker run --rm document-pipeline:dev
 ```
 
 ## CI
 
-`.github/workflows/ci.yml` runs tests, builds the image, runs health checks against the built image, and on push to `main` pushes `ghcr.io/<owner>/mail-pipeline:{latest,<sha>}`.
+`.github/workflows/ci.yml` runs tests, builds the image, runs health checks against the built image, and on push to `main` pushes `ghcr.io/<owner>/document-pipeline:{latest,<sha>}`.
 
-`Dockerfile.watcher` builds the inotify sidecar that fires `POST /trigger-scan`, published as `ghcr.io/<owner>/mail-pipeline-watcher:{latest,<sha>}`. It carries only `inotify-tools` and `curl` — the watch loop is mounted from a ConfigMap in the cluster repo so tuning it needs no image rebuild.
+`Dockerfile.watcher` builds the inotify sidecar that fires `POST /trigger-scan`, published as `ghcr.io/<owner>/document-pipeline-watcher:{latest,<sha>}`. It carries only `inotify-tools` and `curl` — the watch loop is mounted from a ConfigMap in the cluster repo so tuning it needs no image rebuild.
 
 ## Bumping dependencies
 
