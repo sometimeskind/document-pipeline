@@ -17,6 +17,7 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 | Flow | Backstop schedule | Tasks |
 |---|---|---|
 | `mail` | `*/5 * * * *` (`FETCH_CRON`) | `sync_mail` → `index_mail` → `extract_pdfs` → `push_metrics` |
+| `scan` | `0 * * * *` (`SCAN_CRON`) | `process_scans` → `push_scan_metrics` |
 
 ## HTTP API (port `8080`)
 
@@ -24,6 +25,8 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 |---|---|---|---|
 | `GET` | `/health` | open | k8s liveness/readiness probe |
 | `POST` | `/sync/trigger` | bearer | Submit a `mail` flow run and return 202 |
+| `POST` | `/trigger-flow` | bearer | Submit a `mail` flow run, 202 if one is already in flight |
+| `POST` | `/trigger-scan` | bearer | Submit a `scan` flow run, 202 if one is already in flight |
 
 `/sync/trigger` and the cron schedule both submit runs of the same Prefect deployment. Overlapping runs are coalesced by a Prefect named concurrency limit (`mail-pipeline`, `occupy=1`, `timeout_seconds=0`) — a second run that finds the slot taken exits immediately rather than queuing.
 
@@ -89,6 +92,41 @@ The `+paperless` tag is written only to notmuch's database — it is a local mar
 
 Local changes (Thunderbird → Dovecot → `/maildir`) propagate to Proton when the cluster's `inotifywait` sidecar sees the write and calls `POST /sync/trigger`. See [Trigger architecture](#trigger-architecture).
 
+## Scan ingestion (`scan` flow)
+
+A network scanner writes straight to a WebDAV share; the `scan` flow drains that
+share into Paperless and removes each file once Paperless confirms it landed.
+
+```
+Brother MFC ──WebDAV──> Davis ──inotify sidecar──> POST /trigger-scan
+                          ↑                              ↓
+                          └────── PROPFIND / GET / DELETE ┘   scan flow → Paperless
+```
+
+The safety property worth stating explicitly: `POST /api/documents/post_document/`
+returns 2xx when the document is **queued**, not when it is ingested. Deleting on
+that 2xx would destroy the only copy of a scan whose consume task later fails. So
+each file is followed to a terminal Paperless task state and only deleted on
+`success` — or on a `failure` that reports a duplicate, which is what a re-POST
+after a poll timeout produces under `PAPERLESS_CONSUMER_DELETE_DUPLICATES`. Every
+other outcome leaves the file in place for the next sweep, and the
+`scan_pipeline_oldest_pending_file_age_seconds` metric is what alerts on files that
+never clear.
+
+The WebDAV client (`mail_pipeline/webdav.py`) is deliberately generic RFC 4918 —
+PROPFIND `Depth: 1`, GET, DELETE, hand-rolled on `httpx`, matching XML by local
+name and accepting hrefs in either absolute-URI or absolute-path form. Moving to a
+different WebDAV server should be an env repoint, not a code change; the tests run
+every parsing case against two different server response shapes to keep that
+honest.
+
+Only `.pdf/.jpg/.jpeg/.png/.tif/.tiff` are eligible; dotfiles, other extensions and
+subdirectories are left alone and excluded from the pending-file metric, so an
+unrelated file in the share can never hold the staleness alert open forever.
+
+Scan ingestion is opt-in on `WEBDAV_URL`: with it unset the `scan` deployment is
+not registered and the image behaves exactly as before.
+
 ## Environment variables
 
 | Variable | Required | Default | Purpose |
@@ -96,11 +134,16 @@ Local changes (Thunderbird → Dovecot → `/maildir`) propagate to Proton when 
 | `PREFECT_API_URL` | yes | — | Prefect server URL |
 | `PAPERLESS_URL` | yes | — | Paperless base URL |
 | `PAPERLESS_API_TOKEN` | yes | — | Paperless API token |
-| `API_BEARER_TOKEN` | yes | — | Bearer token guarding `/sync/trigger` |
-| `FETCH_CRON` | no | `*/5 * * * *` | Cron schedule for the deployment |
+| `API_BEARER_TOKEN` | yes | — | Bearer token guarding the trigger endpoints |
+| `FETCH_CRON` | no | `*/5 * * * *` | Cron schedule for the `mail` deployment |
 | `PUSHGATEWAY_URL` | no | unset → metrics skipped | Pushgateway URL |
 | `NOTMUCH_CONFIG` | no | `/config/notmuch-config` | Path to notmuch config |
 | `MBSYNC_CONFIG` | no | `/config/mbsyncrc` | Path to mbsync config |
+| `WEBDAV_URL` | no | unset → `scan` flow disabled | WebDAV base URL holding the scans |
+| `WEBDAV_USERNAME` | with `WEBDAV_URL` | — | WebDAV Basic-auth user |
+| `WEBDAV_PASSWORD` | with `WEBDAV_URL` | — | WebDAV Basic-auth password |
+| `WEBDAV_SCAN_PATH` | no | `/` | Path under `WEBDAV_URL` to drain |
+| `SCAN_CRON` | no | `0 * * * *` | Sweep schedule for the `scan` deployment |
 
 ## Volume mounts expected by the image
 
@@ -129,6 +172,8 @@ docker run --rm mail-pipeline:dev
 ## CI
 
 `.github/workflows/ci.yml` runs tests, builds the image, runs health checks against the built image, and on push to `main` pushes `ghcr.io/<owner>/mail-pipeline:{latest,<sha>}`.
+
+`Dockerfile.watcher` builds the inotify sidecar that fires `POST /trigger-scan`, published as `ghcr.io/<owner>/mail-pipeline-watcher:{latest,<sha>}`. It carries only `inotify-tools` and `curl` — the watch loop is mounted from a ConfigMap in the cluster repo so tuning it needs no image rebuild.
 
 ## Bumping dependencies
 

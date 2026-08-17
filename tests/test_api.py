@@ -66,3 +66,31 @@ def test_trigger_flow_returns_503_when_prefect_fails(client):
          patch("mail_pipeline.prefect_client.trigger_sync", return_value=False):
         resp = client.post("/trigger-flow", headers=AUTH)
     assert resp.status_code == 503
+
+
+def test_trigger_scan_returns_200_when_no_active_run(client):
+    with patch("mail_pipeline.prefect_client.has_active_scan_run", return_value=False), \
+         patch("mail_pipeline.prefect_client.trigger_scan", return_value=True):
+        resp = client.post("/trigger-scan", headers=AUTH)
+    assert resp.status_code == 200
+
+
+def test_trigger_scan_coalesces_onto_an_in_flight_run(client):
+    """One inotify event per page must not queue one Prefect run per page."""
+    with patch("mail_pipeline.prefect_client.has_active_scan_run", return_value=True), \
+         patch("mail_pipeline.prefect_client.trigger_scan") as trigger:
+        resp = client.post("/trigger-scan", headers=AUTH)
+    assert resp.status_code == 202
+    trigger.assert_not_called()
+
+
+def test_trigger_scan_returns_401_without_auth(client):
+    resp = client.post("/trigger-scan")
+    assert resp.status_code == 401
+
+
+def test_trigger_scan_returns_503_when_prefect_fails(client):
+    with patch("mail_pipeline.prefect_client.has_active_scan_run", return_value=False), \
+         patch("mail_pipeline.prefect_client.trigger_scan", return_value=False):
+        resp = client.post("/trigger-scan", headers=AUTH)
+    assert resp.status_code == 503

@@ -1,4 +1,4 @@
-"""Prefect tasks and flow for the mail pipeline."""
+"""Prefect tasks and flows for the mail and scan pipelines."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import time
 from prefect import flow, get_run_logger, task
 from prefect.concurrency.sync import concurrency
 
-from mail_pipeline import extract, imap_client, metrics
+from mail_pipeline import extract, imap_client, metrics, scan, webdav
 
 
 @task(name="process-mail", log_prints=True)
@@ -59,5 +59,58 @@ def mail_flow() -> None:
     except TimeoutError:
         if not slot_acquired:
             logger.info("Skipped — mail pipeline already running")
+        else:
+            raise
+
+
+@task(name="process-scans", log_prints=True)
+def process_scans_task() -> scan.ScanResult:
+    """Drain the scanner's WebDAV directory into Paperless."""
+    logger = get_run_logger()
+    started = time.perf_counter()
+
+    client = webdav.WebDAVClient(
+        base_url=os.environ["WEBDAV_URL"],
+        username=os.environ["WEBDAV_USERNAME"],
+        password=os.environ["WEBDAV_PASSWORD"],
+    )
+    result = scan.ingest_scans(
+        client,
+        scan_path=os.environ.get("WEBDAV_SCAN_PATH", "/"),
+        paperless_url=os.environ["PAPERLESS_URL"],
+        paperless_token=os.environ["PAPERLESS_API_TOKEN"],
+    )
+
+    logger.info(
+        "process-scans complete in %.2fs: %d ingested, %d failed, %d ignored",
+        time.perf_counter() - started, result.ingested, result.failed, result.ignored,
+    )
+    return result
+
+
+@task(name="push-scan-metrics", log_prints=True)
+def push_scan_metrics_task(result: scan.ScanResult, duration_seconds: float) -> None:
+    metrics.push_scan_metrics(
+        result.ingested, result.failed, result.pending, result.oldest_pending_age_seconds, duration_seconds
+    )
+
+
+@flow(name="scan", log_prints=True)
+def scan_flow() -> None:
+    logger = get_run_logger()
+    flow_started = time.perf_counter()
+    slot_acquired = False
+    try:
+        # Its own slot, not the mail one: a long OCR wait must not block mail
+        # ingestion, but two scan runs draining the same directory would race
+        # each other into duplicate submissions.
+        with concurrency("scan-pipeline", occupy=1, timeout_seconds=10):
+            slot_acquired = True
+            result = process_scans_task()
+            push_scan_metrics_task(result, time.perf_counter() - flow_started)
+        logger.info("scan flow complete in %.2fs", time.perf_counter() - flow_started)
+    except TimeoutError:
+        if not slot_acquired:
+            logger.info("Skipped — scan pipeline already running")
         else:
             raise

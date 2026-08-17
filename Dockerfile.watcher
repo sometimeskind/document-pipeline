@@ -1,0 +1,13 @@
+# Watch-only sidecar for the Davis pod (homelab #1259).
+#
+# It carries nothing but inotify-tools and curl: the watch loop itself is
+# mounted from a ConfigMap in kubernetes/davis/, the same way mail-sync's
+# trigger.sh is, so tuning the filter or the trigger URL never needs an image
+# rebuild. Runs as 33 (www-data) — the uid Davis owns the WebDAV homes as.
+FROM alpine:3.24.1
+
+RUN apk add --no-cache inotify-tools curl
+
+USER 33:33
+
+CMD ["/bin/sh", "/config/watch.sh"]
