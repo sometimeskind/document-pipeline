@@ -114,7 +114,7 @@ def _ingest_one(
     poll_timeout: float,
 ) -> bool:
     """Submit one scan and delete it once Paperless confirms ingestion."""
-    payload = webdav.get(entry.href)
+    payload = webdav.get(entry.path)
     if payload is None:
         # Another run got there first. Expected under the sweep/trigger overlap
         # and deliberately not a failure — nothing is lost.
@@ -134,7 +134,7 @@ def _ingest_one(
         logger.error("Paperless task %s for %r ended as %s — leaving file in place", task_id, entry.name, status)
         return False
 
-    webdav.delete(entry.href)
+    webdav.delete(entry.path)
     logger.info("Ingested %r (task %s: %s), removed from WebDAV", entry.name, task_id, status)
     return True
 

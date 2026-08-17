@@ -19,7 +19,7 @@ TASK_ID = "a1b2c3d4-e5f6-7890-1234-567890abcdef"
 
 def _entry(name: str, *, is_collection: bool = False, age_hours: float = 1.0) -> WebDAVEntry:
     return WebDAVEntry(
-        href=f"/dav.php/homes/scanner/{name}",
+        path=f"homes/scanner/{name}",
         name=name,
         is_collection=is_collection,
         size=1024,
@@ -66,7 +66,7 @@ def test_successful_ingest_deletes_the_source_file(webdav):
     result = _ingest(webdav)
 
     assert (result.ingested, result.failed, result.pending) == (1, 0, 0)
-    webdav.delete.assert_called_once_with("/dav.php/homes/scanner/scan001.pdf")
+    webdav.delete.assert_called_once_with("homes/scanner/scan001.pdf")
 
 
 @respx.mock
@@ -153,7 +153,7 @@ def test_one_bad_file_does_not_abort_the_batch(webdav):
     result = _ingest(webdav)
 
     assert (result.ingested, result.failed) == (1, 1)
-    webdav.delete.assert_called_once_with("/dav.php/homes/scanner/good.pdf")
+    webdav.delete.assert_called_once_with("homes/scanner/good.pdf")
 
 
 @respx.mock
