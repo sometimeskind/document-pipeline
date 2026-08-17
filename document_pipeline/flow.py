@@ -8,7 +8,7 @@ import time
 from prefect import flow, get_run_logger, task
 from prefect.concurrency.sync import concurrency
 
-from mail_pipeline import extract, imap_client, metrics, scan, webdav
+from document_pipeline import extract, imap_client, metrics, scan, webdav
 
 
 @task(name="process-mail", log_prints=True)

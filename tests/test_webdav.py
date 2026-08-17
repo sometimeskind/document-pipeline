@@ -1,4 +1,4 @@
-"""Tests for mail_pipeline.webdav — the adapter over webdav4.
+"""Tests for document_pipeline.webdav — the adapter over webdav4.
 
 The parsing itself is webdav4's job and is its problem to regress. What these
 tests hold down is the contract this pipeline depends on: that the same code
@@ -19,7 +19,7 @@ import httpx
 import pytest
 import respx
 
-from mail_pipeline.webdav import WebDAVClient
+from document_pipeline.webdav import WebDAVClient
 
 
 SABRE_STYLE = """<?xml version="1.0" encoding="utf-8"?>

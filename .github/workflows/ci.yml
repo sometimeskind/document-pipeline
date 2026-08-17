@@ -52,7 +52,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/mail-pipeline
+          images: ghcr.io/${{ github.repository_owner }}/document-pipeline
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
@@ -74,10 +74,10 @@ jobs:
       - name: Tag image for health checks
         env:
           IMAGE_ID: ${{ steps.build.outputs.imageid }}
-        run: docker tag "$IMAGE_ID" mail-pipeline:ci-local
+        run: docker tag "$IMAGE_ID" document-pipeline:ci-local
 
       - name: Health check — flow imports
-        run: docker run --rm --entrypoint python mail-pipeline:ci-local -c "from mail_pipeline.flow import mail_flow, scan_flow; print(mail_flow.name, scan_flow.name)"
+        run: docker run --rm --entrypoint python document-pipeline:ci-local -c "from document_pipeline.flow import mail_flow, scan_flow; print(mail_flow.name, scan_flow.name)"
 
   build-watcher:
     name: Build & Push Watcher Sidecar
@@ -105,7 +105,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/mail-pipeline-watcher
+          images: ghcr.io/${{ github.repository_owner }}/document-pipeline-watcher
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
@@ -127,5 +127,5 @@ jobs:
         env:
           IMAGE_ID: ${{ steps.build.outputs.imageid }}
         run: |
-          docker tag "$IMAGE_ID" mail-pipeline-watcher:ci-local
-          docker run --rm --entrypoint sh mail-pipeline-watcher:ci-local -c "command -v inotifywait && command -v curl"
+          docker tag "$IMAGE_ID" document-pipeline-watcher:ci-local
+          docker run --rm --entrypoint sh document-pipeline-watcher:ci-local -c "command -v inotifywait && command -v curl"
