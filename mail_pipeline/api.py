@@ -31,4 +31,17 @@ def create_app() -> Flask:
             return jsonify({"error": "failed to start run"}), 503
         return jsonify({}), 200
 
+    @app.post("/trigger-scan")
+    def trigger_scan():
+        # 202 means "a run is already in flight and will pick this up" — the
+        # scan directory is drained wholesale, so an in-flight run covers files
+        # that landed after it started. Callers fire one trigger per inotify
+        # event; coalescing here is what stops a 20-page batch queueing 20 runs.
+        from mail_pipeline import prefect_client
+        if prefect_client.has_active_scan_run():
+            return jsonify({}), 202
+        if not prefect_client.trigger_scan():
+            return jsonify({"error": "failed to start run"}), 503
+        return jsonify({}), 200
+
     return app
