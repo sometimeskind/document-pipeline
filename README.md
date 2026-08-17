@@ -113,12 +113,16 @@ other outcome leaves the file in place for the next sweep, and the
 `scan_pipeline_oldest_pending_file_age_seconds` metric is what alerts on files that
 never clear.
 
-The WebDAV client (`mail_pipeline/webdav.py`) is deliberately generic RFC 4918 —
-PROPFIND `Depth: 1`, GET, DELETE, hand-rolled on `httpx`, matching XML by local
-name and accepting hrefs in either absolute-URI or absolute-path form. Moving to a
-different WebDAV server should be an env repoint, not a code change; the tests run
-every parsing case against two different server response shapes to keep that
-honest.
+WebDAV access goes through [`webdav4`](https://github.com/skshetry/webdav4), which
+speaks RFC 4918 over `httpx` — already a dependency, so no second HTTP stack —
+and whose own suite runs against wsgidav rather than the server we deploy. That
+is the property this pipeline needs: moving to a different WebDAV server should
+be an env repoint, not a code change, and a client tested against a *different*
+server than ours is better evidence of that than fixtures we wrote ourselves.
+`mail_pipeline/webdav.py` is only a thin adapter for the three things the library
+leaves to the caller: entry shape, already-gone resources treated as success, and
+a not-yet-created scan directory treated as an empty one. The tests still run
+every case against two differently-shaped multistatus responses.
 
 Only `.pdf/.jpg/.jpeg/.png/.tif/.tiff` are eligible; dotfiles, other extensions and
 subdirectories are left alone and excluded from the pending-file metric, so an
