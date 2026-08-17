@@ -7,7 +7,7 @@ name = "mail-pipeline"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "prefect>=3.8.1,<4",
+    "prefect>=3.8.3,<4",
     "flask>=3.0",
     "waitress>=3.0",
     "httpx>=0.27",
