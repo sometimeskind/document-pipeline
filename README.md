@@ -185,6 +185,7 @@ pre-existing library — the same code path, just a wider query.
 | `ENRICH_SWEEP_BATCH_SIZE` | no | `20` | Documents per sweep run |
 | `ENRICH_SUGGEST_TIMEOUT` | no | `650` | Read timeout for `ai_suggestions`, in seconds |
 | `ENRICH_RESULTS_PATH` | no | `/state/enrich/results.jsonl` | Per-document enrichment result log |
+| `PREFECT_LOGGING_EXTRA_LOGGERS` | no | unset → module logs stay out of the Prefect UI | Set to `document_pipeline` to route module logs into flow run logs |
 
 ## Volume mounts expected by the image
 
