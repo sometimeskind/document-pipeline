@@ -77,7 +77,7 @@ jobs:
         run: docker tag "$IMAGE_ID" document-pipeline:ci-local
 
       - name: Health check — flow imports
-        run: docker run --rm --entrypoint python document-pipeline:ci-local -c "from document_pipeline.flow import mail_flow, scan_flow; print(mail_flow.name, scan_flow.name)"
+        run: docker run --rm --entrypoint python document-pipeline:ci-local -c "from document_pipeline.flow import enrich_flow, enrich_sweep_flow, mail_flow, scan_flow; print(mail_flow.name, scan_flow.name, enrich_flow.name, enrich_sweep_flow.name)"
 
   build-watcher:
     name: Build & Push Watcher Sidecar

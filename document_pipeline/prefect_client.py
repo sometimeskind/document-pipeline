@@ -8,14 +8,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def _submit(name: str) -> None:
+async def _submit(name: str, parameters: dict | None = None) -> None:
     from prefect.deployments import run_deployment
-    await run_deployment(f"{name}/{name}", timeout=0)
+    await run_deployment(f"{name}/{name}", parameters=parameters, timeout=0)
 
 
-def _trigger(name: str) -> bool:
+def _trigger(name: str, parameters: dict | None = None) -> bool:
     try:
-        asyncio.run(_submit(name))
+        asyncio.run(_submit(name, parameters))
         return True
     except Exception as exc:
         logger.error("Failed to submit %s run: %s", name, exc)
@@ -86,6 +86,19 @@ def has_active_scan_run() -> bool:
     return _has_active_run("scan")
 
 
+def trigger_enrich(document_id: int) -> bool:
+    """Submit an `enrich` deployment run for one document. Returns True if accepted.
+
+    Note there is no `has_active_enrich_run()` companion, unlike every other
+    trigger here. Coalescing is right for scan and mail because those runs drain
+    a source wholesale, so an in-flight run covers later arrivals. Two different
+    document ids are not interchangeable work — coalescing would silently drop
+    documents. One run per document instead, which also gives a Prefect run page
+    per document.
+    """
+    return _trigger("enrich", {"document_id": document_id})
+
+
 async def _clear_schedules(name: str) -> None:
     import os
     import httpx
@@ -116,7 +129,11 @@ def clear_deployment_schedules(name: str = "mail") -> None:
 async def _upsert_limits() -> None:
     from prefect import get_client
     async with get_client() as client:
-        for name in ("mail-pipeline", "scan-pipeline"):
+        # `ollama` is not a pipeline slot: it guards the shared single-GPU
+        # model. OLLAMA_NUM_PARALLEL=1 already serializes inference; this makes
+        # that explicit and queued rather than a pile of timeouts, and is the
+        # prerequisite for ever giving Ollama a second consumer.
+        for name in ("mail-pipeline", "scan-pipeline", "ollama"):
             await client.upsert_global_concurrency_limit_by_name(name=name, limit=1)
 
 
@@ -124,6 +141,6 @@ def ensure_concurrency_limits() -> None:
     """Create/update the Prefect global concurrency limits used by the flows."""
     try:
         asyncio.run(_upsert_limits())
-        logger.info("Prefect concurrency limits ensured: mail-pipeline=1, scan-pipeline=1")
+        logger.info("Prefect concurrency limits ensured: mail-pipeline=1, scan-pipeline=1, ollama=1")
     except Exception as exc:
         logger.warning("Could not upsert Prefect concurrency limit: %s", exc)

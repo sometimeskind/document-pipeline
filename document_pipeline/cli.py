@@ -41,7 +41,7 @@ def main() -> None:
 
     import waitress
     from document_pipeline.api import create_app
-    from document_pipeline.flow import mail_flow, scan_flow
+    from document_pipeline.flow import enrich_flow, enrich_sweep_flow, mail_flow, scan_flow
     from document_pipeline.prefect_client import ensure_concurrency_limits
 
     fetch_cron = os.environ.get("FETCH_CRON")
@@ -68,8 +68,19 @@ def main() -> None:
     if scan_enabled:
         deployments.append(scan_flow.to_deployment(name="scan", cron=scan_cron))
 
+    # Trigger-driven, so no cron. `concurrency_limit` is not the Ollama slot the
+    # flow itself takes — it is what keeps queued runs out of the serve() runner.
+    # The in-flow slot blocks *inside* a run, so without this a burst of consumed
+    # documents fills every runner slot with runs waiting on Ollama and the mail
+    # cron cannot start. Here they wait in AwaitingConcurrencySlot instead.
+    deployments.append(enrich_flow.to_deployment(name="enrich", concurrency_limit=1))
+    enrich_sweep_cron = os.environ.get("ENRICH_SWEEP_CRON") or None
+    deployments.append(enrich_sweep_flow.to_deployment(name="enrich-sweep", cron=enrich_sweep_cron))
+
     logger.info(
-        "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s)",
-        fetch_cron or "disabled", scan_cron if scan_enabled else "disabled",
+        "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s, ENRICH_SWEEP_CRON=%s)",
+        fetch_cron or "disabled",
+        scan_cron if scan_enabled else "disabled",
+        enrich_sweep_cron or "disabled",
     )
     prefect_serve(*deployments)

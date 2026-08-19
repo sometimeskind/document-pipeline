@@ -81,7 +81,7 @@ def ingest_scans(
 
     remaining: list[WebDAVEntry] = []
     with httpx.Client(headers={"Authorization": f"Token {paperless_token}"}, timeout=60.0) as client:
-        tag_ids = [_resolve_tag(client, paperless_url, tag)] if tag else []
+        tag_ids = [resolve_tag(client, paperless_url, tag)] if tag else []
         for entry in eligible:
             try:
                 if not _ingest_one(entry, webdav, client, paperless_url, tag_ids, poll_interval, poll_timeout):
@@ -139,7 +139,7 @@ def _ingest_one(
     return True
 
 
-def _resolve_tag(client: httpx.Client, paperless_url: str, name: str) -> int:
+def resolve_tag(client: httpx.Client, paperless_url: str, name: str) -> int:
     """Return the id of the named tag, creating it if it does not exist."""
     resp = client.get(f"{paperless_url}/api/tags/", params={"name__iexact": name})
     resp.raise_for_status()
