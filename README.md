@@ -18,6 +18,8 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 |---|---|---|
 | `mail` | `*/5 * * * *` (`FETCH_CRON`) | `sync_mail` → `index_mail` → `extract_pdfs` → `push_metrics` |
 | `scan` | `0 * * * *` (`SCAN_CRON`) | `process_scans` → `push_scan_metrics` |
+| `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
+| `enrich-sweep` | unset (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
 
 ## HTTP API (port `8080`)
 
@@ -27,6 +29,7 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 | `POST` | `/sync/trigger` | bearer | Submit a `mail` flow run and return 202 |
 | `POST` | `/trigger-flow` | bearer | Submit a `mail` flow run, 202 if one is already in flight |
 | `POST` | `/trigger-scan` | bearer | Submit a `scan` flow run, 202 if one is already in flight |
+| `POST` | `/trigger-enrich` | bearer | Submit an `enrich` flow run for `{"document_id": N}`. No coalescing — 400 on a bad id |
 
 `/sync/trigger` and the cron schedule both submit runs of the same Prefect deployment. Overlapping runs are coalesced by a Prefect named concurrency limit (`mail-pipeline`, `occupy=1`, `timeout_seconds=0`) — a second run that finds the slot taken exits immediately rather than queuing.
 
@@ -131,6 +134,35 @@ unrelated file in the share can never hold the staleness alert open forever.
 Scan ingestion is opt-in on `WEBDAV_URL`: with it unset the `scan` deployment is
 not registered and the image behaves exactly as before.
 
+## Document enrichment
+
+Paperless 3.0 ships LLM suggestions but only behind the manual "Suggest" button —
+nothing runs during consumption. The `enrich` flow is that missing automation: it
+reads the document, asks Paperless for an `ai_suggestions` title and tag matches,
+and writes back the title plus the **union** of the document's existing tags, the
+matched tags, and an `ai-processed` marker.
+
+It is post-consume by necessity: `ai_suggestions` reads `document.content`, which
+does not exist until Paperless has done the OCR. Paperless's consume is an
+external async step in this pipeline, and the post-consume hook is that step's
+completion callback — it POSTs `/trigger-enrich`, which is why enrichment covers
+**every** ingest path, including documents uploaded through the Paperless UI that
+never touched this service.
+
+Two details are load-bearing:
+
+- **Unmatched tag names are recorded, never applied.** Applying them would let the
+  model grow the tag vocabulary one document at a time. They go to the results
+  JSONL instead, which is what a vocabulary is curated from.
+- **Ollama work is held in a `concurrency("ollama", occupy=1)` slot** with no
+  timeout. Unlike the mail and scan slots, a busy slot must *queue* here: those
+  flows drain a source wholesale so a skipped run is covered by the next one, but
+  a skipped enrich run silently loses that document.
+
+`enrich-sweep` enriches documents that carry no marker. It covers a dropped
+trigger, and with a large enough batch it is also the backfill over a
+pre-existing library — the same code path, just a wider query.
+
 ## Environment variables
 
 | Variable | Required | Default | Purpose |
@@ -148,13 +180,18 @@ not registered and the image behaves exactly as before.
 | `WEBDAV_PASSWORD` | with `WEBDAV_URL` | — | WebDAV Basic-auth password |
 | `WEBDAV_SCAN_PATH` | no | `/` | Path under `WEBDAV_URL` to drain |
 | `SCAN_CRON` | no | `0 * * * *` | Sweep schedule for the `scan` deployment |
+| `PAPERLESS_ADMIN_TOKEN` | no | falls back to `PAPERLESS_API_TOKEN` | Superuser Paperless token used by `enrich` |
+| `ENRICH_SWEEP_CRON` | no | unset → sweep has no schedule | Cron for the `enrich-sweep` deployment |
+| `ENRICH_SWEEP_BATCH_SIZE` | no | `20` | Documents per sweep run |
+| `ENRICH_SUGGEST_TIMEOUT` | no | `650` | Read timeout for `ai_suggestions`, in seconds |
+| `ENRICH_RESULTS_PATH` | no | `/state/enrich/results.jsonl` | Per-document enrichment result log |
 
 ## Volume mounts expected by the image
 
 | Path | Purpose |
 |---|---|
 | `/maildir/` | Maildir — mbsync writes here, notmuch indexes here |
-| `/state/` | Reserved for future use |
+| `/state/` | Prefect client state (`PREFECT_HOME`) and the enrichment results JSONL |
 | `/config/mbsyncrc` | mbsync config |
 | `/config/notmuch-config` | notmuch config |
 | `/secrets/bridge-imap-password/password` | Bridge IMAP password (referenced from `mbsyncrc`) |

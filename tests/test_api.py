@@ -94,3 +94,37 @@ def test_trigger_scan_returns_503_when_prefect_fails(client):
          patch("document_pipeline.prefect_client.trigger_scan", return_value=False):
         resp = client.post("/trigger-scan", headers=AUTH)
     assert resp.status_code == 503
+
+
+def test_trigger_enrich_submits_a_run_for_the_document(client):
+    with patch("document_pipeline.prefect_client.trigger_enrich", return_value=True) as trigger:
+        resp = client.post("/trigger-enrich", headers=AUTH, json={"document_id": 42})
+    assert resp.status_code == 200
+    trigger.assert_called_once_with(42)
+
+
+def test_trigger_enrich_does_not_coalesce(client):
+    """Unlike /trigger-scan: two document ids are not interchangeable work."""
+    with patch("document_pipeline.prefect_client.trigger_enrich", return_value=True) as trigger:
+        client.post("/trigger-enrich", headers=AUTH, json={"document_id": 42})
+        client.post("/trigger-enrich", headers=AUTH, json={"document_id": 43})
+    assert [c.args[0] for c in trigger.call_args_list] == [42, 43]
+
+
+@pytest.mark.parametrize("body", [None, {}, {"document_id": "42"}, {"document_id": 0}, {"document_id": True}])
+def test_trigger_enrich_rejects_a_bad_document_id(client, body):
+    with patch("document_pipeline.prefect_client.trigger_enrich") as trigger:
+        resp = client.post("/trigger-enrich", headers=AUTH, json=body)
+    assert resp.status_code == 400
+    trigger.assert_not_called()
+
+
+def test_trigger_enrich_returns_401_without_auth(client):
+    resp = client.post("/trigger-enrich", json={"document_id": 42})
+    assert resp.status_code == 401
+
+
+def test_trigger_enrich_returns_503_when_prefect_fails(client):
+    with patch("document_pipeline.prefect_client.trigger_enrich", return_value=False):
+        resp = client.post("/trigger-enrich", headers=AUTH, json={"document_id": 42})
+    assert resp.status_code == 503

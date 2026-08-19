@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from document_pipeline.auth import setup_auth
 
@@ -41,6 +41,20 @@ def create_app() -> Flask:
         if prefect_client.has_active_scan_run():
             return jsonify({}), 202
         if not prefect_client.trigger_scan():
+            return jsonify({"error": "failed to start run"}), 503
+        return jsonify({}), 200
+
+    @app.post("/trigger-enrich")
+    def trigger_enrich():
+        # No 202/coalescing path, unlike the triggers above: enrichment is
+        # per-document, so answering "a run is already in flight" would drop
+        # this document. One flow run per id instead.
+        from document_pipeline import prefect_client
+        body = request.get_json(silent=True) or {}
+        document_id = body.get("document_id")
+        if not isinstance(document_id, int) or isinstance(document_id, bool) or document_id <= 0:
+            return jsonify({"error": "document_id must be a positive integer"}), 400
+        if not prefect_client.trigger_enrich(document_id):
             return jsonify({"error": "failed to start run"}), 503
         return jsonify({}), 200
 

@@ -7,7 +7,7 @@ import os
 import time
 
 import httpx
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway, pushadd_to_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +154,60 @@ def push_scan_metrics(
     _push(url, "scan-pipeline", registry)
 
 
+def push_enrich_metrics(document_id: int, succeeded: bool) -> None:
+    """Push auto-title health under the job the PaperlessAutoTitleFailing rule reads.
+
+    Deliberately the same job name and the same series the shell hook used, so
+    the alert in kubernetes/paperless/prometheus-rules.yaml needs no change.
+
+    Success and failure are separate series pushed with POST rather than one
+    shared result gauge replaced with PUT. That is load-bearing: with a shared
+    gauge, document N+1 succeeding overwrote document N failing, which is how
+    the alert stayed green while 3 of 8 documents lost their titles (#1295).
+    """
+    url = os.environ.get("PUSHGATEWAY_URL", "")
+    if not url:
+        return
+
+    registry = CollectorRegistry()
+    if succeeded:
+        Gauge(
+            "paperless_autotitle_last_success_timestamp",
+            "Unix timestamp of the last successful document enrichment",
+            registry=registry,
+        ).set(time.time())
+    else:
+        Gauge(
+            "paperless_autotitle_last_failure_timestamp",
+            "Unix timestamp of the last failed document enrichment",
+            registry=registry,
+        ).set(time.time())
+        # The document id rides along so the alert can name the document that
+        # lost its title instead of sending the operator to grep the logs.
+        Gauge(
+            "paperless_autotitle_last_failure_document",
+            "Paperless document id of the last failed enrichment",
+            registry=registry,
+        ).set(document_id)
+
+    _pushadd(url, "paperless_autotitle", registry)
+
+
 def _push(url: str, job: str, registry: CollectorRegistry) -> None:
     try:
         push_to_gateway(url, job=job, registry=registry, timeout=10)
+    except Exception as exc:
+        logger.warning("Pushgateway push failed: %s", exc)
+
+
+def _pushadd(url: str, job: str, registry: CollectorRegistry) -> None:
+    """POST rather than PUT: replaces only the metrics named in the payload.
+
+    `_push` replaces the whole group, which is what the mail and scan flows want
+    — each pushes its complete set every run. Enrichment pushes one half of its
+    group at a time, so it must leave the other half standing.
+    """
+    try:
+        pushadd_to_gateway(url, job=job, registry=registry, timeout=10)
     except Exception as exc:
         logger.warning("Pushgateway push failed: %s", exc)
