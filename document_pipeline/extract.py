@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+import unicodedata
+from email.header import decode_header, make_header
 from email.message import Message
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Paperless derives the title from the filename stem and Document.title is
+# max_length=128, so keep the stem comfortably under that.
+_MAX_STEM_CHARS = 120
+# Senders that fumble RFC 2231 wrap the whole `charset''value` in an RFC 2047
+# word, so the charset tag survives decoding as literal text (e.g.
+# "utf-8''Leistungsübersicht.pdf"). Observed on 4 of the 47 documents this bug
+# produced.
+_RFC2231_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9_.:+-]*''")
 
 
 def submit_message_pdfs(msg: Message, paperless_url: str, paperless_token: str) -> bool:
@@ -28,7 +40,7 @@ def _submit_pdfs(msg: Message, client: httpx.Client, paperless_url: str) -> tupl
     for part in msg.walk():
         if part.get_content_type() != "application/pdf":
             continue
-        filename = part.get_filename() or "attachment.pdf"
+        filename = _attachment_filename(part)
         payload = part.get_payload(decode=True)
         if not payload:
             logger.warning("  PDF part %r had empty payload, skipping", filename)
@@ -50,6 +62,40 @@ def _submit_pdfs(msg: Message, client: httpx.Client, paperless_url: str) -> tupl
         total += size
 
     return count, total
+
+
+def _attachment_filename(part: Message) -> str:
+    """Decoded, sanitised filename for a PDF part."""
+    raw = part.get_filename()
+    if not raw:
+        return "attachment.pdf"
+    try:
+        # get_filename() collapses RFC 2231 continuations but leaves RFC 2047
+        # encoded-words verbatim — illegal inside a Content-Disposition
+        # parameter, emitted by plenty of MUAs anyway (#1297).
+        decoded = str(make_header(decode_header(raw)))
+    except Exception:
+        # LookupError on an unknown charset, HeaderParseError on bad base64.
+        # A mangled name is worth far more than a dropped document.
+        logger.warning("  could not decode attachment filename %r, using it as-is", raw)
+        decoded = raw
+    return _sanitise(_RFC2231_PREFIX.sub("", decoded))
+
+
+def _sanitise(name: str) -> str:
+    """Make a decoded filename safe for the multipart filename field."""
+    # Sender-controlled text now heading for a form field and a filesystem.
+    name = name.replace("/", "_").replace("\\", "_")
+    # Category C* is control/format/surrogate/unassigned — nothing that belongs
+    # in a filename, and CR/LF would otherwise ride into a multipart header.
+    name = "".join(c for c in name if unicodedata.category(c)[0] != "C")
+    name = name.strip(" .")
+    if not name:
+        return "attachment.pdf"
+    stem, dot, ext = name.rpartition(".")
+    if not dot or ext.lower() != "pdf":
+        stem, ext = name, "pdf"
+    return f"{stem[:_MAX_STEM_CHARS]}.{ext}"
 
 
 def _human_size(n: int) -> str:
