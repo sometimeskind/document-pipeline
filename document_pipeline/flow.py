@@ -117,7 +117,9 @@ def scan_flow() -> None:
 
 
 @task(name="enrich-document", retries=2, retry_delay_seconds=[60, 300], log_prints=True)
-def enrich_document_task(document_id: int, marker_id: int | None = None) -> enrich.EnrichResult:
+def enrich_document_task(
+    document_id: int, marker_id: int | None = None, dry_run: bool = False
+) -> enrich.EnrichResult:
     """Retitle and tag one consumed document.
 
     Retries cover the 503 `ai_suggestions` returns when Ollama is saturated —
@@ -131,7 +133,9 @@ def enrich_document_task(document_id: int, marker_id: int | None = None) -> enri
     with enrich.open_client(_paperless_admin_token()) as client:
         if marker_id is None:
             marker_id = enrich.resolve_marker_tag(client, paperless_url)
-        result = enrich.enrich_document(client, paperless_url, document_id, marker_id)
+        result = enrich.enrich_document(
+            client, paperless_url, document_id, marker_id, dry_run=dry_run
+        )
 
     enrich.append_result(result)
     logger.info(
@@ -179,29 +183,56 @@ def enrich_flow(document_id: int) -> None:
 
 
 @flow(name="enrich-sweep", log_prints=True)
-def enrich_sweep_flow(batch_size: int | None = None) -> None:
+def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> None:
     """Enrich documents that carry no `ai-processed` marker.
 
-    Belt and braces for a dropped trigger — and, with a large enough batch, this
-    is the backfill over the pre-existing library (#1280): same code path, wider
-    query, rather than a separate one-off script.
+    Belt and braces for a dropped trigger — and, run on a cron, this is the
+    backfill over the pre-existing library (#1280): same code path, repeated,
+    rather than a separate one-off script.
+
+    `dry_run` reports what it would do and writes nothing, which is how a sample
+    gets reviewed before 2000-odd documents are retitled and renamed for real.
+    Because a dry run leaves no marker, it re-reads the same documents every
+    time — it is a sample, not a pass over the library.
     """
     logger = get_run_logger()
     flow_started = time.perf_counter()
+    slot_acquired = False
     if batch_size is None:
         batch_size = int(os.environ.get("ENRICH_SWEEP_BATCH_SIZE", "20"))
 
+    try:
+        # An hourly cron whose batch runs long would otherwise overlap the next
+        # run, and both would query the same unenriched set and do the same work
+        # twice. Skipping is right here for the same reason it is in mail_flow:
+        # whatever this run does not reach, the next hour picks up.
+        with concurrency("enrich-sweep", occupy=1, timeout_seconds=10):
+            slot_acquired = True
+            _run_sweep(batch_size, dry_run)
+        logger.info("enrich-sweep complete in %.2fs", time.perf_counter() - flow_started)
+    except TimeoutError:
+        if not slot_acquired:
+            logger.info("Skipped — enrich sweep already running")
+        else:
+            raise
+
+
+def _run_sweep(batch_size: int, dry_run: bool) -> None:
+    logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
         marker_id = enrich.resolve_marker_tag(client, paperless_url)
         document_ids = enrich.find_unenriched(client, paperless_url, marker_id, batch_size)
 
-    logger.info("enrich-sweep: %d unenriched document(s), batch size %d", len(document_ids), batch_size)
+    logger.info(
+        "enrich-sweep: %d unenriched document(s), batch size %d%s",
+        len(document_ids), batch_size, " (DRY RUN — nothing will be written)" if dry_run else "",
+    )
     enriched = failed = 0
     for document_id in document_ids:
         try:
             with concurrency("ollama", occupy=1):
-                enrich_document_task(document_id, marker_id)
+                enrich_document_task(document_id, marker_id, dry_run)
             enriched += 1
         except Exception as exc:
             # Per-document isolation: one document the LLM cannot handle must
@@ -210,7 +241,4 @@ def enrich_sweep_flow(batch_size: int | None = None) -> None:
             failed += 1
             push_enrich_metrics_task(document_id, succeeded=False)
 
-    logger.info(
-        "enrich-sweep complete in %.2fs: %d enriched, %d failed",
-        time.perf_counter() - flow_started, enriched, failed,
-    )
+    logger.info("enrich-sweep: %d processed, %d failed", enriched, failed)

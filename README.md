@@ -19,7 +19,7 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 | `mail` | `*/5 * * * *` (`FETCH_CRON`) | `sync_mail` → `index_mail` → `extract_pdfs` → `push_metrics` |
 | `scan` | `0 * * * *` (`SCAN_CRON`) | `process_scans` → `push_scan_metrics` |
 | `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
-| `enrich-sweep` | unset (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
+| `enrich-sweep` | `0 * * * *` (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
 
 ## HTTP API (port `8080`)
 
@@ -160,8 +160,34 @@ Two details are load-bearing:
   a skipped enrich run silently loses that document.
 
 `enrich-sweep` enriches documents that carry no marker. It covers a dropped
-trigger, and with a large enough batch it is also the backfill over a
-pre-existing library — the same code path, just a wider query.
+trigger, and run on a cron it is also the backfill over a pre-existing library —
+the same code path, repeated, rather than a separate one-off script. Its own
+`concurrency("enrich-sweep", occupy=1)` slot stops a long batch from overlapping
+the next cron firing and doing the same documents twice.
+
+Two things exist for the backfill specifically:
+
+- **A document whose title is not `Path(original_file_name).stem[:127]` is never
+  retitled.** That is precisely what paperless's consumer writes at consume time,
+  so inequality is an exact test for "a human or a workflow named this" rather
+  than a guess. Such documents still get the marker, so the sweep converges. A
+  freshly consumed document always compares equal, so this never fires on the
+  trigger path.
+- **`dry_run=true` writes nothing** — no PATCH, so no marker, no filename rename
+  and no state change. It reports the proposed title and the unmatched names to
+  the results JSONL for review. Because it leaves no marker it re-reads the same
+  documents every time: it is a sample, not a pass over the library. It is a
+  flow-run parameter, not an env var, deliberately — the sweep's steady-state job
+  is catching dropped triggers, and a dry-run default would silently disable it.
+
+Harvest the vocabulary the corpus asked for from the results JSONL:
+
+```bash
+kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline vocab
+```
+
+Tagging cannot bootstrap itself — `match_tags_by_name` only matches tags that
+already exist — so those names have to be created before matching can ever fire.
 
 ## Environment variables
 

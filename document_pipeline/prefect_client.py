@@ -133,7 +133,9 @@ async def _upsert_limits() -> None:
         # model. OLLAMA_NUM_PARALLEL=1 already serializes inference; this makes
         # that explicit and queued rather than a pile of timeouts, and is the
         # prerequisite for ever giving Ollama a second consumer.
-        for name in ("mail-pipeline", "scan-pipeline", "ollama"):
+        # `enrich-sweep` keeps a long hourly batch from overlapping the next
+        # cron firing and doing the same documents twice (#1280).
+        for name in ("mail-pipeline", "scan-pipeline", "ollama", "enrich-sweep"):
             await client.upsert_global_concurrency_limit_by_name(name=name, limit=1)
 
 
@@ -141,6 +143,9 @@ def ensure_concurrency_limits() -> None:
     """Create/update the Prefect global concurrency limits used by the flows."""
     try:
         asyncio.run(_upsert_limits())
-        logger.info("Prefect concurrency limits ensured: mail-pipeline=1, scan-pipeline=1, ollama=1")
+        logger.info(
+            "Prefect concurrency limits ensured: "
+            "mail-pipeline=1, scan-pipeline=1, ollama=1, enrich-sweep=1"
+        )
     except Exception as exc:
         logger.warning("Could not upsert Prefect concurrency limit: %s", exc)

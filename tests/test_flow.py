@@ -249,3 +249,61 @@ def test_enrich_sweep_batch_size_defaults_from_the_environment(monkeypatch):
         enrich_sweep_flow()
 
         assert mock_enrich.find_unenriched.call_args.args[-1] == 7
+
+
+def test_enrich_sweep_skipped_when_a_previous_sweep_is_still_running(monkeypatch):
+    """An hourly cron over a long batch overlaps itself; both runs would then
+    query the same unenriched set and do every document twice."""
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.side_effect = TimeoutError
+        mock_concurrency.return_value.__exit__.return_value = False
+
+        enrich_sweep_flow(batch_size=3)
+
+        mock_enrich.find_unenriched.assert_not_called()
+        mock_task.assert_not_called()
+
+
+def test_enrich_sweep_passes_dry_run_through_to_every_document(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.find_unenriched.return_value = [1, 2]
+        mock_task.side_effect = [_result(1), _result(2)]
+
+        enrich_sweep_flow(batch_size=2, dry_run=True)
+
+        assert [c.args for c in mock_task.call_args_list] == [(1, 9, True), (2, 9, True)]
+
+
+def test_enrich_sweep_is_live_by_default(monkeypatch):
+    """The sweep's steady-state job is catching dropped triggers — defaulting it
+    to dry-run would silently disable that (#1280)."""
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.find_unenriched.return_value = [1]
+        mock_task.side_effect = [_result(1)]
+
+        enrich_sweep_flow(batch_size=1)
+
+        assert mock_task.call_args.args == (1, 9, False)
