@@ -28,7 +28,35 @@ _REQUIRED_SCAN = ("WEBDAV_USERNAME", "WEBDAV_PASSWORD")
 _DEFAULT_SCAN_CRON = "0 * * * *"
 
 
+def _print_vocab() -> None:
+    """Frequency-ranked tag names the model proposed that matched nothing.
+
+    The one read-only subcommand this image has, because the data it reports on
+    lives on a PVC only this pod mounts. It is the #1280 harvesting step: tags
+    cannot bootstrap themselves, so the vocabulary has to be created before
+    matching can ever fire, and this is the only evidence of which names are
+    worth creating.
+
+        kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline vocab
+    """
+    from document_pipeline import enrich
+
+    try:
+        documents, ranked = enrich.rank_suggested_tags()
+    except FileNotFoundError:
+        logger.error("No enrich results yet — nothing has run.")
+        sys.exit(1)
+
+    print(f"{documents} document(s), {len(ranked)} distinct unmatched tag name(s)")
+    for name, count in ranked:
+        print(f"{count:6d}  {name}")
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "vocab":
+        _print_vocab()
+        return
+
     missing = [v for v in _REQUIRED if not os.environ.get(v)]
     if os.environ.get("WEBDAV_URL"):
         missing += [v for v in _REQUIRED_SCAN if not os.environ.get(v)]

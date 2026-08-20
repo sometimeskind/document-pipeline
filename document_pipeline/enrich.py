@@ -12,6 +12,7 @@ post-consume hook rather than done inline at submit time.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -31,6 +32,13 @@ logger = logging.getLogger(__name__)
 MIN_CONTENT_CHARS = 50
 
 MAX_TITLE_CHARS = 128  # documents.models.Document.title max_length
+
+# What paperless's own consumer sets a new document's title to:
+# `Path(filename).stem[:127]` (documents/consumer.py). One character short of
+# the column width, and that is the point — it makes "is this title still the
+# one the consumer generated?" an exact test rather than a guess about what a
+# machine-generated title looks like.
+CONSUME_TITLE_CHARS = 127
 
 # Applied to every document this module touches. `find_unenriched` queries on its
 # absence, so it is both the sweep's resume marker and the guard that makes a
@@ -143,10 +151,44 @@ def find_unenriched(
     return [int(r["id"]) for r in resp.json().get("results") or []]
 
 
+def has_curated_title(document: dict) -> bool:
+    """True when something other than paperless's consumer named this document.
+
+    The backfill (#1280) reaches documents that predate auto-titling, and some of
+    those were titled by hand. There is no "title edited" flag to read, but there
+    does not need to be one: the consumer's title is exactly
+    `Path(original_file_name).stem[:127]`, so any inequality means a human, a
+    workflow or an earlier enrichment run wrote that title.
+
+    A freshly consumed document always compares equal, so this never fires on the
+    post-consume trigger path — it only ever bites on the sweep.
+
+    A document with no `original_file_name` cannot be tested at all. Those are
+    treated as un-curated and enriched, deliberately: the alternative is marking
+    them processed and silently never titling them, and the contract is that this
+    must never cost a document its title.
+    """
+    original = document.get("original_file_name")
+    if not original:
+        return False
+    return document.get("title") != Path(original).stem[:CONSUME_TITLE_CHARS]
+
+
 def enrich_document(
-    client: httpx.Client, paperless_url: str, document_id: int, marker_id: int
+    client: httpx.Client,
+    paperless_url: str,
+    document_id: int,
+    marker_id: int,
+    *,
+    dry_run: bool = False,
 ) -> EnrichResult:
-    """Retitle and tag one document. Raises on any Paperless or LLM failure."""
+    """Retitle and tag one document. Raises on any Paperless or LLM failure.
+
+    `dry_run` reports what would be written without writing anything: no PATCH,
+    so no marker, no filename rename and no state change of any kind. That also
+    makes it non-resuming — it re-reports the same documents every time — which
+    is exactly what makes a sample reviewable before the live pass.
+    """
     started = time.perf_counter()
 
     document = fetch_document(client, paperless_url, document_id)
@@ -159,6 +201,23 @@ def enrich_document(
             duration_seconds=time.perf_counter() - started,
         )
 
+    if has_curated_title(document):
+        # Marked anyway, so the sweep converges instead of re-reading this
+        # document every hour for the rest of the library's life.
+        logger.info(
+            "Document %s has a curated title %r — leaving it alone",
+            document_id, document.get("title"),
+        )
+        if not dry_run:
+            patch_document(
+                client, paperless_url, document_id, merge_tags(existing_tags, [], marker_id)
+            )
+        return EnrichResult(
+            document_id=document_id,
+            outcome="skipped-curated-title",
+            duration_seconds=time.perf_counter() - started,
+        )
+
     content_length = len((document.get("content") or "").strip())
     if content_length < MIN_CONTENT_CHARS:
         # Not a failure: an empty scan has nothing to title from. Marked anyway,
@@ -167,7 +226,10 @@ def enrich_document(
             "Document %s has only %d chars of OCR content (min %d) — leaving title unchanged",
             document_id, content_length, MIN_CONTENT_CHARS,
         )
-        patch_document(client, paperless_url, document_id, merge_tags(existing_tags, [], marker_id))
+        if not dry_run:
+            patch_document(
+                client, paperless_url, document_id, merge_tags(existing_tags, [], marker_id)
+            )
         return EnrichResult(
             document_id=document_id,
             outcome="skipped-short-content",
@@ -183,6 +245,21 @@ def enrich_document(
 
     if not title:
         raise ValueError(f"LLM returned an empty title for document {document_id}")
+
+    if dry_run:
+        logger.info(
+            "Document %s WOULD be retitled -> %r (tags: %s + %s, unmatched: %s)",
+            document_id, title, existing_tags or "none", matched_tags or "none",
+            suggested_tags or "none",
+        )
+        return EnrichResult(
+            document_id=document_id,
+            outcome="dry-run",
+            title=title,
+            matched_tags=matched_tags,
+            suggested_tags=suggested_tags,
+            duration_seconds=time.perf_counter() - started,
+        )
 
     tags = merge_tags(existing_tags, matched_tags, marker_id)
     patch_document(client, paperless_url, document_id, tags, title=title)
@@ -221,3 +298,50 @@ def append_result(result: EnrichResult, path: str | None = None) -> None:
         # The record is an artifact, not the job. Losing a line must not cost
         # the document its title.
         logger.warning("Could not append enrich result for %s: %s", result.document_id, exc)
+
+
+def rank_suggested_tags(path: str | None = None) -> tuple[int, list[tuple[str, int]]]:
+    """Frequency-rank the proposed tag names that matched nothing, from the JSONL.
+
+    Tagging cannot bootstrap itself. `match_tags_by_name` only ever matches tags
+    that ALREADY EXIST and has no creation path, so until a name is in the
+    vocabulary no document can be given it — and the #1280 backfill would spend
+    hours proposing names into the void. These are the names the corpus itself
+    asked for, which beats a vocabulary invented from memory.
+
+    Counted once per document, so one suggestion repeating a name cannot inflate
+    its own rank. Names are grouped case-insensitively because paperless matches
+    that way (`paperless_ai/matching.py` case-folds before comparing); the
+    reported spelling is the most common one seen.
+
+    Returns (documents considered, [(name, document count)]) ranked descending.
+    """
+    target = Path(path or os.environ.get("ENRICH_RESULTS_PATH", DEFAULT_RESULTS_PATH))
+    documents: set[int] = set()
+    counts: collections.Counter[str] = collections.Counter()
+    spellings: dict[str, collections.Counter[str]] = {}
+
+    with target.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # A torn final line from a killed pod must not cost the whole
+                # harvest — every earlier line is still good.
+                logger.warning("Skipping malformed line in %s", target)
+                continue
+            documents.add(record.get("document_id"))
+            names = [n.strip() for n in record.get("suggested_tags") or [] if n.strip()]
+            for key in {n.lower() for n in names}:
+                counts[key] += 1
+            for name in names:
+                spellings.setdefault(name.lower(), collections.Counter())[name] += 1
+
+    ranked = [
+        (spellings[name].most_common(1)[0][0], count)
+        for name, count in counts.most_common()
+    ]
+    return len(documents), ranked

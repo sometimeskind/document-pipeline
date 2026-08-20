@@ -27,10 +27,20 @@ def _client():
     return enrich.open_client("tok", suggest_timeout=5.0)
 
 
-def _mock_document(*, content=_LONG_CONTENT, tags=(3,), title="scan_0042"):
+def _mock_document(
+    *, content=_LONG_CONTENT, tags=(3,), title="scan_0042", original="scan_0042.pdf"
+):
+    """A document as paperless's consumer leaves it: title == filename stem."""
     return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
         return_value=httpx.Response(
-            200, json={"id": DOC_ID, "title": title, "content": content, "tags": list(tags)}
+            200,
+            json={
+                "id": DOC_ID,
+                "title": title,
+                "content": content,
+                "tags": list(tags),
+                "original_file_name": original,
+            },
         )
     )
 
@@ -50,9 +60,9 @@ def _mock_patch():
     )
 
 
-def _enrich():
+def _enrich(*, dry_run=False):
     with _client() as client:
-        return enrich.enrich_document(client, PAPERLESS, DOC_ID, MARKER_ID)
+        return enrich.enrich_document(client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=dry_run)
 
 
 # --- merge_tags: the union that keeps a PATCH from destroying existing tags ---
@@ -223,3 +233,133 @@ def test_append_result_survives_an_unwritable_path(tmp_path):
         enrich.EnrichResult(document_id=DOC_ID, outcome="enriched"),
         path=str(blocker / "nested.jsonl"),
     )
+
+
+# --- the curated-title guard: the #1280 backfill's only safety rule ---
+
+def test_a_consumer_generated_title_is_not_curated():
+    assert not enrich.has_curated_title(
+        {"title": "scan_0042", "original_file_name": "scan_0042.pdf"}
+    )
+
+
+def test_a_long_filename_is_compared_at_the_consumer_truncation_point():
+    """consumer.py stores stem[:127], so a longer stem must still compare equal."""
+    stem = "a" * 200
+    assert not enrich.has_curated_title(
+        {"title": stem[:127], "original_file_name": f"{stem}.pdf"}
+    )
+
+
+def test_a_hand_written_title_is_curated():
+    assert enrich.has_curated_title(
+        {"title": "Geburtsurkunde", "original_file_name": "upload_kMvk1i.pdf"}
+    )
+
+
+def test_a_document_with_no_original_filename_is_enriched_rather_than_skipped():
+    """Unprovable is not the same as curated, and a skip is silent and permanent."""
+    assert not enrich.has_curated_title({"title": "Anything", "original_file_name": None})
+
+
+@respx.mock
+def test_a_curated_title_is_marked_but_never_retitled():
+    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf", tags=(3,))
+    suggestions = _mock_suggestions()
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "skipped-curated-title"
+    assert not suggestions.called  # costs no LLM call at all
+    # Marked, so the sweep converges instead of re-reading it every hour forever.
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3, MARKER_ID]}
+
+
+# --- dry run: the review pass that must not be able to write ---
+
+@respx.mock
+def test_dry_run_reports_the_title_without_patching_anything():
+    _mock_document(tags=(3,))
+    _mock_suggestions(tags=(5,), suggested_tags=("shipping",))
+    patch = _mock_patch()
+
+    result = _enrich(dry_run=True)
+
+    assert result.outcome == "dry-run"
+    assert result.title == "Invoice from Hermes"
+    assert result.matched_tags == [5]
+    assert result.suggested_tags == ["shipping"]
+    assert not patch.called
+
+
+@respx.mock
+def test_dry_run_does_not_mark_a_curated_document():
+    """No marker means no rename and no state change — a dry run is repeatable."""
+    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf")
+    patch = _mock_patch()
+
+    assert _enrich(dry_run=True).outcome == "skipped-curated-title"
+    assert not patch.called
+
+
+@respx.mock
+def test_dry_run_does_not_mark_a_short_content_document():
+    _mock_document(content="too short")
+    patch = _mock_patch()
+
+    assert _enrich(dry_run=True).outcome == "skipped-short-content"
+    assert not patch.called
+
+
+# --- the vocabulary harvest ---
+
+def _write_results(tmp_path, records):
+    target = tmp_path / "results.jsonl"
+    target.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    return str(target)
+
+
+def test_rank_suggested_tags_ranks_by_document_count(tmp_path):
+    path = _write_results(tmp_path, [
+        {"document_id": 1, "suggested_tags": ["invoice", "shipping"]},
+        {"document_id": 2, "suggested_tags": ["invoice"]},
+        {"document_id": 3, "suggested_tags": ["invoice", "tax"]},
+    ])
+
+    documents, ranked = enrich.rank_suggested_tags(path)
+
+    assert documents == 3
+    assert ranked == [("invoice", 3), ("shipping", 1), ("tax", 1)]
+
+
+def test_rank_suggested_tags_groups_spellings_the_way_paperless_matches(tmp_path):
+    """paperless_ai.matching case-folds before comparing, so ranking must too —
+    otherwise one tag splits across two entries and neither looks worth creating."""
+    path = _write_results(tmp_path, [
+        {"document_id": 1, "suggested_tags": ["Invoice"]},
+        {"document_id": 2, "suggested_tags": ["invoice"]},
+        {"document_id": 3, "suggested_tags": ["Invoice"]},
+    ])
+
+    _, ranked = enrich.rank_suggested_tags(path)
+
+    assert ranked == [("Invoice", 3)]  # most common spelling reported
+
+
+def test_rank_suggested_tags_counts_a_repeated_name_once_per_document(tmp_path):
+    path = _write_results(tmp_path, [{"document_id": 1, "suggested_tags": ["tax", "tax"]}])
+
+    assert enrich.rank_suggested_tags(path)[1] == [("tax", 1)]
+
+
+def test_rank_suggested_tags_survives_a_torn_final_line(tmp_path):
+    """A pod killed mid-write must not cost the whole harvest."""
+    target = tmp_path / "results.jsonl"
+    target.write_text(
+        json.dumps({"document_id": 1, "suggested_tags": ["invoice"]}) + "\n{\"document_",
+        encoding="utf-8",
+    )
+
+    assert enrich.rank_suggested_tags(str(target)) == (1, [("invoice", 1)])
+
