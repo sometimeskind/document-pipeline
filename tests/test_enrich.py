@@ -153,12 +153,17 @@ def _fallback_env(monkeypatch, url=OLLAMA, model="qwen-test"):
     monkeypatch.setenv("ENRICH_OLLAMA_MODEL", model)
 
 
-def _mock_ollama(name="symbox"):
-    return respx.post(f"{OLLAMA}/api/chat").mock(
-        return_value=httpx.Response(
-            200, json={"message": {"content": json.dumps({"correspondent": name})}}
+def _mock_ollama(name="symbox", title="Factuur van Hermes"):
+    """Serve both dedicated queries — they POST the same /api/chat and are only
+    distinguishable by which field their schema requires."""
+    def respond(request):
+        field = json.loads(request.content)["format"]["required"][0]
+        value = title if field == "title" else name
+        return httpx.Response(
+            200, json={"message": {"content": json.dumps({field: value})}}
         )
-    )
+
+    return respx.post(f"{OLLAMA}/api/chat").mock(side_effect=respond)
 
 
 # --- the #1366 fallback: paperless's own pass reliably suggests nothing ---
@@ -216,10 +221,10 @@ def test_fallback_empty_string_means_no_correspondent(monkeypatch):
 
 @respx.mock
 def test_fallback_is_not_consulted_when_paperless_suggested_a_name(monkeypatch):
-    """respx would raise on the unmocked ollama call if the fallback fired."""
     _fallback_env(monkeypatch)
     _mock_document()
     _mock_suggestions(suggested_correspondents=("symbox",))
+    ollama = _mock_ollama()
     _mock_correspondent_search(results=())
     _mock_correspondent_create()
     _mock_patch()
@@ -227,6 +232,9 @@ def test_fallback_is_not_consulted_when_paperless_suggested_a_name(monkeypatch):
     result = _enrich()
 
     assert result.correspondent == "symbox"
+    # Only the title query reached ollama — no correspondent query fired.
+    fields = [json.loads(c.request.content)["format"]["required"] for c in ollama.calls]
+    assert fields == [["title"]]
 
 
 @respx.mock
@@ -257,6 +265,104 @@ def test_fallback_is_off_when_unconfigured(monkeypatch):
 
     assert result.correspondent is None
     assert "correspondent" not in json.loads(patch.calls.last.request.content)
+
+
+# --- the #43 dedicated title query: paperless's prompt has no language pin ---
+# Documents are mocked with a correspondent so that path stays out of the way.
+
+@respx.mock
+def test_title_comes_from_the_dedicated_query_not_the_suggestions(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(correspondent=1)
+    _mock_suggestions(title="Invoice from Hermes")
+    ollama = _mock_ollama(title="Factuur van Hermes")
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    request = json.loads(ollama.calls.last.request.content)
+    assert request["format"]["required"] == ["title"]
+    assert "never translate the title" in request["messages"][0]["content"]
+    assert json.loads(patch.calls.last.request.content)["title"] == "Factuur van Hermes"
+    assert result.title == "Factuur van Hermes"
+
+
+@respx.mock
+def test_title_falls_back_to_suggestions_when_unconfigured(monkeypatch):
+    """Pre-#43 behavior when the env is absent — the image can land before the manifest."""
+    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
+    _mock_document(correspondent=1)
+    _mock_suggestions()
+    _mock_patch()
+
+    result = _enrich()
+
+    assert result.title == "Invoice from Hermes"
+
+
+@respx.mock
+def test_title_query_failure_falls_back_to_suggestions(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(correspondent=1)
+    _mock_suggestions()
+    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "enriched"
+    assert json.loads(patch.calls.last.request.content)["title"] == "Invoice from Hermes"
+
+
+@respx.mock
+def test_title_query_sends_capped_content(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(content="x" * 5000, correspondent=1)
+    _mock_suggestions()
+    ollama = _mock_ollama()
+    _mock_patch()
+
+    _enrich()
+
+    prompt = json.loads(ollama.calls.last.request.content)["messages"][0]["content"]
+    assert prompt.endswith("x" * enrich.FALLBACK_CONTENT_CHARS)
+    assert "x" * (enrich.FALLBACK_CONTENT_CHARS + 1) not in prompt
+
+
+@respx.mock
+def test_empty_title_from_both_sources_raises(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(correspondent=1)
+    _mock_suggestions(title="")
+    _mock_ollama(title="")
+    patch = _mock_patch()
+
+    with pytest.raises(ValueError):
+        _enrich()
+
+    assert not patch.calls
+
+
+@respx.mock
+def test_title_and_correspondent_queries_both_fire(monkeypatch):
+    """One extra query each, title first — the whole budget of #42 plus #43."""
+    _fallback_env(monkeypatch)
+    _mock_document()
+    _mock_suggestions(title="")
+    ollama = _mock_ollama(name="Cloudflare", title="Factuur maart")
+    _mock_correspondent_search(results=())
+    _mock_correspondent_create(correspondent_id=31)
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    fields = [json.loads(c.request.content)["format"]["required"] for c in ollama.calls]
+    assert fields == [["title"], ["correspondent"]]
+    payload = json.loads(patch.calls.last.request.content)
+    assert payload["title"] == "Factuur maart"
+    assert payload["correspondent"] == 31
+    assert result.correspondent == "Cloudflare"
 
 @respx.mock
 def test_a_suggested_correspondent_is_created_unowned_and_assigned():
