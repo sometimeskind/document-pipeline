@@ -145,6 +145,119 @@ def test_suggested_tags_are_recorded_but_never_applied():
 
 # --- correspondents (#1363) ---
 
+OLLAMA = "http://ollama"
+
+
+def _fallback_env(monkeypatch, url=OLLAMA, model="qwen-test"):
+    monkeypatch.setenv("ENRICH_OLLAMA_URL", url)
+    monkeypatch.setenv("ENRICH_OLLAMA_MODEL", model)
+
+
+def _mock_ollama(name="symbox"):
+    return respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(
+            200, json={"message": {"content": json.dumps({"correspondent": name})}}
+        )
+    )
+
+
+# --- the #1366 fallback: paperless's own pass reliably suggests nothing ---
+
+@respx.mock
+def test_fallback_asks_ollama_when_paperless_suggests_nothing(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document()
+    _mock_suggestions()  # no correspondents, no suggested_correspondents
+    ollama = _mock_ollama("Cloudflare")
+    _mock_correspondent_search(results=())
+    create = _mock_correspondent_create(correspondent_id=31)
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    request = json.loads(ollama.calls.last.request.content)
+    assert request["model"] == "qwen-test"
+    assert request["format"]["required"] == ["correspondent"]
+    assert json.loads(create.calls.last.request.content) == {"name": "Cloudflare", "owner": None}
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 31
+    assert result.correspondent == "Cloudflare"
+
+
+@respx.mock
+def test_fallback_sends_capped_content(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(content="x" * 5000)
+    _mock_suggestions()
+    ollama = _mock_ollama("")
+    _mock_patch()
+
+    _enrich()
+
+    prompt = json.loads(ollama.calls.last.request.content)["messages"][0]["content"]
+    assert prompt.endswith("x" * enrich.FALLBACK_CONTENT_CHARS)
+    assert "x" * (enrich.FALLBACK_CONTENT_CHARS + 1) not in prompt
+
+
+@respx.mock
+def test_fallback_empty_string_means_no_correspondent(monkeypatch):
+    """The required field lets the model decline; an invented blank must not create."""
+    _fallback_env(monkeypatch)
+    _mock_document()
+    _mock_suggestions()
+    _mock_ollama("")
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "enriched"
+    assert result.correspondent is None
+    assert "correspondent" not in json.loads(patch.calls.last.request.content)
+
+
+@respx.mock
+def test_fallback_is_not_consulted_when_paperless_suggested_a_name(monkeypatch):
+    """respx would raise on the unmocked ollama call if the fallback fired."""
+    _fallback_env(monkeypatch)
+    _mock_document()
+    _mock_suggestions(suggested_correspondents=("symbox",))
+    _mock_correspondent_search(results=())
+    _mock_correspondent_create()
+    _mock_patch()
+
+    result = _enrich()
+
+    assert result.correspondent == "symbox"
+
+
+@respx.mock
+def test_fallback_failure_never_costs_the_title(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document()
+    _mock_suggestions()
+    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "enriched"
+    assert result.correspondent is None
+    assert json.loads(patch.calls.last.request.content)["title"] == "Invoice from Hermes"
+
+
+@respx.mock
+def test_fallback_is_off_when_unconfigured(monkeypatch):
+    """No env vars, no ollama call — the image can land before the manifest."""
+    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
+    _mock_document()
+    _mock_suggestions()
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.correspondent is None
+    assert "correspondent" not in json.loads(patch.calls.last.request.content)
+
 @respx.mock
 def test_a_suggested_correspondent_is_created_unowned_and_assigned():
     """The `owner: None` in the create payload is the #1292 rule: an owned
