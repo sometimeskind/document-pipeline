@@ -33,6 +33,8 @@ MIN_CONTENT_CHARS = 50
 
 MAX_TITLE_CHARS = 128  # documents.models.Document.title max_length
 
+MAX_CORRESPONDENT_CHARS = 128  # documents.models.Correspondent.name max_length
+
 # What paperless's own consumer sets a new document's title to:
 # `Path(filename).stem[:127]` (documents/consumer.py). One character short of
 # the column width, and that is the point — it makes "is this title still the
@@ -69,6 +71,10 @@ class EnrichResult:
     # Recorded because they are the only evidence of which tags are worth
     # creating: matching can never fire for a tag that does not exist yet.
     suggested_tags: list[str] = field(default_factory=list)
+    # Name of the correspondent assigned (or, on a dry run, the one that would
+    # be). Unlike suggested_tags these ARE applied, creation included — see
+    # pick_correspondent for why that is not the vocabulary-growth mistake.
+    correspondent: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -106,15 +112,20 @@ def patch_document(
     document_id: int,
     tags: list[int],
     title: str | None = None,
+    correspondent: int | None = None,
 ) -> None:
     """Write back tags, and the title only when we have one to write.
 
     Omitting `title` is what keeps the short-content path from rewriting a title
     it never generated — it still gets the marker so the sweep stops picking it.
+    Same rule for `correspondent`: None means "leave whatever is there alone",
+    never "clear it".
     """
     payload: dict[str, object] = {"tags": tags}
     if title is not None:
         payload["title"] = title
+    if correspondent is not None:
+        payload["correspondent"] = correspondent
     resp = client.patch(f"{paperless_url}/api/documents/{document_id}/", json=payload)
     resp.raise_for_status()
 
@@ -132,6 +143,62 @@ def merge_tags(existing: list[int], matched: list[int], marker_id: int) -> list[
     scan flow applies at ingest.
     """
     return sorted({int(t) for t in existing} | {int(t) for t in matched} | {int(marker_id)})
+
+
+def pick_correspondent(suggestions: dict) -> tuple[int | None, str | None]:
+    """(existing id, name to create) from the suggestion — at most one is set.
+
+    `correspondents` are ids paperless already matched (exact, then difflib
+    fuzzy) against EXISTING correspondents; a match wins because it cannot add
+    a new spelling. Otherwise the first non-blank `suggested_correspondents`
+    name is the creation candidate.
+
+    Creating from an LLM name is the opposite of the suggested_tags policy, and
+    deliberately so (#1363): a tag is a taxonomy choice, where an LLM inventing
+    entries per document degrades the vocabulary — but a correspondent is the
+    sender's own name read off the document, and refusing to create it means no
+    document from a new sender ever gets one.
+    """
+    matched = [int(c) for c in suggestions.get("correspondents") or []]
+    if matched:
+        return matched[0], None
+    for raw in suggestions.get("suggested_correspondents") or []:
+        name = " ".join(str(raw).split())[:MAX_CORRESPONDENT_CHARS]
+        if name:
+            return None, name
+    return None, None
+
+
+def fetch_correspondent_name(
+    client: httpx.Client, paperless_url: str, correspondent_id: int
+) -> str:
+    resp = client.get(f"{paperless_url}/api/correspondents/{correspondent_id}/")
+    resp.raise_for_status()
+    return str(resp.json().get("name") or "")
+
+
+def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -> int:
+    """Return the id of the named correspondent, creating it UNOWNED if missing.
+
+    The shape of scan.resolve_tag, with one addition that is not optional:
+    `owner: None`. An API-created object is owned by the token's user, and
+    paperless's match_correspondents_by_name filters through
+    get_objects_for_user_owner_aware — an owned correspondent is silently
+    invisible to matching on other users' documents forever (#1292).
+    """
+    resp = client.get(f"{paperless_url}/api/correspondents/", params={"name__iexact": name})
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if results:
+        return int(results[0]["id"])
+
+    resp = client.post(
+        f"{paperless_url}/api/correspondents/", json={"name": name, "owner": None}
+    )
+    resp.raise_for_status()
+    correspondent_id = int(resp.json()["id"])
+    logger.info("Created Paperless correspondent %r (id %s)", name, correspondent_id)
+    return correspondent_id
 
 
 def find_unenriched(
@@ -246,11 +313,30 @@ def enrich_document(
     if not title:
         raise ValueError(f"LLM returned an empty title for document {document_id}")
 
+    # Correspondent: only when the document has none — an existing assignment,
+    # however it got there, outranks the LLM. The matched-id read and the
+    # get-or-create are both idempotent, so a retried PATCH cannot duplicate.
+    correspondent_id: int | None = None
+    correspondent_name: str | None = None
+    if document.get("correspondent") is None:
+        matched_correspondent, new_correspondent = pick_correspondent(suggestions)
+        if matched_correspondent is not None:
+            correspondent_id = matched_correspondent
+            correspondent_name = fetch_correspondent_name(
+                client, paperless_url, matched_correspondent
+            )
+        elif new_correspondent and not dry_run:
+            correspondent_id = resolve_correspondent(client, paperless_url, new_correspondent)
+            correspondent_name = new_correspondent
+        elif new_correspondent:
+            # Dry run reports the name but must not create anything.
+            correspondent_name = new_correspondent
+
     if dry_run:
         logger.info(
-            "Document %s WOULD be retitled -> %r (tags: %s + %s, unmatched: %s)",
+            "Document %s WOULD be retitled -> %r (tags: %s + %s, unmatched: %s, correspondent: %s)",
             document_id, title, existing_tags or "none", matched_tags or "none",
-            suggested_tags or "none",
+            suggested_tags or "none", correspondent_name or "none",
         )
         return EnrichResult(
             document_id=document_id,
@@ -258,15 +344,19 @@ def enrich_document(
             title=title,
             matched_tags=matched_tags,
             suggested_tags=suggested_tags,
+            correspondent=correspondent_name,
             duration_seconds=time.perf_counter() - started,
         )
 
     tags = merge_tags(existing_tags, matched_tags, marker_id)
-    patch_document(client, paperless_url, document_id, tags, title=title)
+    patch_document(
+        client, paperless_url, document_id, tags, title=title, correspondent=correspondent_id
+    )
 
     logger.info(
-        "Document %s retitled -> %r (tags: %s + %s)",
+        "Document %s retitled -> %r (tags: %s + %s, correspondent: %s)",
         document_id, title, existing_tags or "none", matched_tags or "none",
+        correspondent_name or "none",
     )
     return EnrichResult(
         document_id=document_id,
@@ -274,6 +364,7 @@ def enrich_document(
         title=title,
         matched_tags=matched_tags,
         suggested_tags=suggested_tags,
+        correspondent=correspondent_name,
         duration_seconds=time.perf_counter() - started,
     )
 
