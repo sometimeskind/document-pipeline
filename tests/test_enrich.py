@@ -28,7 +28,8 @@ def _client():
 
 
 def _mock_document(
-    *, content=_LONG_CONTENT, tags=(3,), title="scan_0042", original="scan_0042.pdf"
+    *, content=_LONG_CONTENT, tags=(3,), title="scan_0042", original="scan_0042.pdf",
+    correspondent=None,
 ):
     """A document as paperless's consumer leaves it: title == filename stem."""
     return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
@@ -40,17 +41,39 @@ def _mock_document(
                 "content": content,
                 "tags": list(tags),
                 "original_file_name": original,
+                "correspondent": correspondent,
             },
         )
     )
 
 
-def _mock_suggestions(*, title="Invoice from Hermes", tags=(5,), suggested_tags=("shipping",)):
+def _mock_suggestions(
+    *, title="Invoice from Hermes", tags=(5,), suggested_tags=("shipping",),
+    correspondents=(), suggested_correspondents=(),
+):
     return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/ai_suggestions/").mock(
         return_value=httpx.Response(
             200,
-            json={"title": title, "tags": list(tags), "suggested_tags": list(suggested_tags)},
+            json={
+                "title": title,
+                "tags": list(tags),
+                "suggested_tags": list(suggested_tags),
+                "correspondents": list(correspondents),
+                "suggested_correspondents": list(suggested_correspondents),
+            },
         )
+    )
+
+
+def _mock_correspondent_search(*, results=()):
+    return respx.get(f"{PAPERLESS}/api/correspondents/").mock(
+        return_value=httpx.Response(200, json={"results": list(results)})
+    )
+
+
+def _mock_correspondent_create(correspondent_id=17):
+    return respx.post(f"{PAPERLESS}/api/correspondents/").mock(
+        return_value=httpx.Response(201, json={"id": correspondent_id})
     )
 
 
@@ -118,6 +141,78 @@ def test_suggested_tags_are_recorded_but_never_applied():
 
     assert result.suggested_tags == ["shipping", "hermes"]
     assert json.loads(patch.calls.last.request.content)["tags"] == [5, MARKER_ID]
+
+
+# --- correspondents (#1363) ---
+
+@respx.mock
+def test_a_suggested_correspondent_is_created_unowned_and_assigned():
+    """The `owner: None` in the create payload is the #1292 rule: an owned
+    correspondent is invisible to paperless's matching on other users' documents."""
+    _mock_document()
+    _mock_suggestions(suggested_correspondents=("symbox",))
+    _mock_correspondent_search(results=())
+    create = _mock_correspondent_create(correspondent_id=17)
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert json.loads(create.calls.last.request.content) == {"name": "symbox", "owner": None}
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 17
+    assert result.correspondent == "symbox"
+
+
+@respx.mock
+def test_an_existing_correspondent_is_reused_rather_than_duplicated():
+    """A replayed trigger after a failed PATCH must find its own earlier create."""
+    _mock_document()
+    _mock_suggestions(suggested_correspondents=("symbox",))
+    _mock_correspondent_search(results=({"id": 21, "name": "Symbox"},))
+    patch = _mock_patch()
+
+    _enrich()
+
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 21
+
+
+@respx.mock
+def test_a_matched_correspondent_id_wins_over_a_suggested_name():
+    _mock_document()
+    _mock_suggestions(correspondents=(7,), suggested_correspondents=("Symbox GmbH & Co",))
+    respx.get(f"{PAPERLESS}/api/correspondents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "name": "Symbox"})
+    )
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 7
+    assert result.correspondent == "Symbox"
+
+
+@respx.mock
+def test_an_existing_assignment_is_never_overwritten():
+    """However a correspondent got onto the document, it outranks the LLM."""
+    _mock_document(correspondent=4)
+    _mock_suggestions(correspondents=(7,), suggested_correspondents=("symbox",))
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert "correspondent" not in json.loads(patch.calls.last.request.content)
+    assert result.correspondent is None
+
+
+@respx.mock
+def test_dry_run_reports_the_correspondent_without_creating_it():
+    """No search, no POST — respx would raise on any unmocked correspondent call."""
+    _mock_document()
+    _mock_suggestions(suggested_correspondents=("symbox",))
+
+    result = _enrich(dry_run=True)
+
+    assert result.outcome == "dry-run"
+    assert result.correspondent == "symbox"
 
 
 @respx.mock
@@ -221,6 +316,7 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
         "title": "Invoice from Hermes",
         "matched_tags": [5],
         "suggested_tags": ["shipping"],
+        "correspondent": None,
         "duration_seconds": 1.5,
     }
 
