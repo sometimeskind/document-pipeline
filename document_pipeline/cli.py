@@ -69,7 +69,13 @@ def main() -> None:
 
     import waitress
     from document_pipeline.api import create_app
-    from document_pipeline.flow import enrich_flow, enrich_sweep_flow, mail_flow, scan_flow
+    from document_pipeline.flow import (
+        correspondent_backfill_flow,
+        enrich_flow,
+        enrich_sweep_flow,
+        mail_flow,
+        scan_flow,
+    )
     from document_pipeline.prefect_client import ensure_concurrency_limits
 
     fetch_cron = os.environ.get("FETCH_CRON")
@@ -105,10 +111,27 @@ def main() -> None:
     enrich_sweep_cron = os.environ.get("ENRICH_SWEEP_CRON") or None
     deployments.append(enrich_sweep_flow.to_deployment(name="enrich-sweep", cron=enrich_sweep_cron))
 
+    # Correspondent backfill (#1373): gated on the same env as the Ollama query
+    # it runs, so an image that lands ahead of its manifest registers nothing.
+    # Like the sweep, registered without a schedule when the cron is unset so a
+    # dry-run sample can still be started from the Prefect UI.
+    backfill_enabled = bool(
+        os.environ.get("ENRICH_OLLAMA_URL") and os.environ.get("ENRICH_OLLAMA_MODEL")
+    )
+    backfill_cron = os.environ.get("CORRESPONDENT_BACKFILL_CRON") or None
+    if backfill_enabled:
+        deployments.append(
+            correspondent_backfill_flow.to_deployment(
+                name="correspondent-backfill", cron=backfill_cron
+            )
+        )
+
     logger.info(
-        "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s, ENRICH_SWEEP_CRON=%s)",
+        "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s, ENRICH_SWEEP_CRON=%s, "
+        "CORRESPONDENT_BACKFILL_CRON=%s)",
         fetch_cron or "disabled",
         scan_cron if scan_enabled else "disabled",
         enrich_sweep_cron or "disabled",
+        (backfill_cron or "unscheduled") if backfill_enabled else "disabled",
     )
     prefect_serve(*deployments)

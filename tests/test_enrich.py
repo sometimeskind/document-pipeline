@@ -678,3 +678,172 @@ def test_rank_suggested_tags_survives_a_torn_final_line(tmp_path):
 
     assert enrich.rank_suggested_tags(str(target)) == (1, [("invoice", 1)])
 
+
+
+# --- the correspondent backfill (#1373) ---
+
+DECLINED_ID = 11
+
+
+def _backfill(*, dry_run=False):
+    with _client() as client:
+        return enrich.backfill_correspondent(
+            client, PAPERLESS, DOC_ID, DECLINED_ID, dry_run=dry_run
+        )
+
+
+@respx.mock
+def test_backfill_patches_only_the_correspondent(monkeypatch):
+    """No title, no tags: some of these titles are curated, and the PATCH must
+    leave both byte-identical. And no ai_suggestions call at all — the paperless
+    pass is known-dry, and respx would raise on the unmocked route."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3, MARKER_ID), title="Curated by hand")
+    ollama = _mock_ollama("Cloudflare")
+    _mock_correspondent_search(results=())
+    create = _mock_correspondent_create(correspondent_id=31)
+    patch = _mock_patch()
+
+    result = _backfill()
+
+    fields = [json.loads(c.request.content)["format"]["required"] for c in ollama.calls]
+    assert fields == [["correspondent"]]
+    assert json.loads(create.calls.last.request.content) == {"name": "Cloudflare", "owner": None}
+    assert json.loads(patch.calls.last.request.content) == {"correspondent": 31}
+    assert result.outcome == "backfilled"
+    assert result.correspondent == "Cloudflare"
+
+
+@respx.mock
+def test_backfill_reuses_an_existing_correspondent(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3, MARKER_ID))
+    _mock_ollama("symbox")
+    _mock_correspondent_search(results=({"id": 21, "name": "Symbox"},))
+    patch = _mock_patch()
+
+    _backfill()
+
+    assert json.loads(patch.calls.last.request.content) == {"correspondent": 21}
+
+
+@respx.mock
+def test_backfill_marks_a_declined_document_so_it_is_never_re_queried(monkeypatch):
+    """The terminal marker: without it the document matches correspondent__isnull
+    again next hour, forever. Existing tags are merged back in, nothing else moves."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3, MARKER_ID))
+    _mock_ollama("")
+    patch = _mock_patch()
+
+    result = _backfill()
+
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3, MARKER_ID, DECLINED_ID]}
+    assert result.outcome == "declined"
+    assert result.correspondent is None
+
+
+@respx.mock
+def test_backfill_marks_an_ocr_floor_document_without_asking(monkeypatch):
+    """The sweep marks sub-floor documents `ai-processed` untitled, so they land
+    in this query too. There is nothing to ask about; mark them, don't query."""
+    _fallback_env(monkeypatch)
+    _mock_document(content="", tags=(MARKER_ID,))
+    ollama = _mock_ollama()
+    patch = _mock_patch()
+
+    result = _backfill()
+
+    assert not ollama.called
+    assert json.loads(patch.calls.last.request.content) == {"tags": [MARKER_ID, DECLINED_ID]}
+    assert result.outcome == "skipped-short-content"
+
+
+@respx.mock
+def test_backfill_raises_on_an_ollama_failure_rather_than_marking(monkeypatch):
+    """The one place the fallback's fold-to-None would be wrong: a transient
+    timeout marked `no-correspondent` is lost to the backfill for good. Raise,
+    write nothing, let Prefect retry."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(MARKER_ID,))
+    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
+    patch = _mock_patch()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _backfill()
+
+    assert not patch.called
+
+
+@respx.mock
+def test_backfill_raises_when_unconfigured(monkeypatch):
+    """Unlike the fallback, off cannot mean "decline everything"."""
+    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
+    _mock_document(tags=(MARKER_ID,))
+    patch = _mock_patch()
+
+    with pytest.raises(RuntimeError):
+        _backfill()
+
+    assert not patch.called
+
+
+@respx.mock
+def test_backfill_leaves_a_document_that_gained_a_correspondent_alone(monkeypatch):
+    """The sweep or a hand edit can get there between the query and the fetch."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(MARKER_ID,), correspondent=4)
+    ollama = _mock_ollama()
+    patch = _mock_patch()
+
+    result = _backfill()
+
+    assert result.outcome == "already-has-correspondent"
+    assert not ollama.called
+    assert not patch.called
+
+
+@respx.mock
+def test_backfill_dry_run_reports_without_creating_or_patching(monkeypatch):
+    """No search, no POST, no PATCH — respx would raise on any of them."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(MARKER_ID,))
+    _mock_ollama("Cloudflare")
+
+    result = _backfill(dry_run=True)
+
+    assert result.outcome == "dry-run"
+    assert result.correspondent == "Cloudflare"
+
+
+@respx.mock
+def test_backfill_dry_run_does_not_mark_a_declined_document(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(MARKER_ID,))
+    _mock_ollama("")
+    patch = _mock_patch()
+
+    result = _backfill(dry_run=True)
+
+    assert result.outcome == "declined"
+    assert not patch.called
+
+
+@respx.mock
+def test_find_without_correspondent_queries_enriched_unmarked_documents():
+    route = respx.get(f"{PAPERLESS}/api/documents/").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": 1}, {"id": 2}]})
+    )
+
+    with _client() as client:
+        assert enrich.find_without_correspondent(
+            client, PAPERLESS, MARKER_ID, DECLINED_ID, 8
+        ) == [1, 2]
+
+    params = route.calls.last.request.url.params
+    assert params["tags__id__all"] == str(MARKER_ID)
+    assert params["tags__id__none"] == str(DECLINED_ID)
+    assert params["correspondent__isnull"] == "true"
+    assert params["page_size"] == "8"
+    assert params["ordering"] == "id"

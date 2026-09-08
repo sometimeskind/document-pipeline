@@ -307,3 +307,129 @@ def test_enrich_sweep_is_live_by_default(monkeypatch):
         enrich_sweep_flow(batch_size=1)
 
         assert mock_task.call_args.args == (1, 9, False)
+
+
+# --- correspondent backfill (#1373) ---
+
+def _backfill_result(document_id: int, correspondent: str | None = "Symbox"):
+    from document_pipeline.enrich import EnrichResult
+    return EnrichResult(
+        document_id=document_id,
+        outcome="backfilled" if correspondent else "declined",
+        correspondent=correspondent,
+    )
+
+
+def test_backfill_task_records_every_result_to_the_jsonl(monkeypatch):
+    from document_pipeline.flow import backfill_correspondent_task
+    _enrich_env(monkeypatch)
+    monkeypatch.setenv("PAPERLESS_ADMIN_TOKEN", "superuser-tok")
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.get_run_logger"):
+        mock_enrich.backfill_correspondent.return_value = _backfill_result(42)
+
+        backfill_correspondent_task.fn(42, 11)
+
+        mock_enrich.open_client.assert_called_once_with("superuser-tok")
+        assert mock_enrich.backfill_correspondent.call_args.args[2:] == (42, 11)
+        mock_enrich.append_result.assert_called_once()
+
+
+def test_backfill_continues_past_a_failing_document_and_counts_outcomes(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_declined_tag.return_value = 11
+        mock_enrich.find_without_correspondent.return_value = [1, 2, 3]
+        mock_task.side_effect = [
+            _backfill_result(1), ValueError("boom"), _backfill_result(3, correspondent=None)
+        ]
+
+        correspondent_backfill_flow(batch_size=3)
+
+        # One bad document must not strand the rest of the batch behind it.
+        assert [c.args for c in mock_task.call_args_list] == [
+            (1, 11, False), (2, 11, False), (3, 11, False)
+        ]
+        assert mock_enrich.find_without_correspondent.call_args.args[2:] == (9, 11, 3)
+
+
+def test_backfill_batch_size_defaults_from_the_environment(monkeypatch):
+    _enrich_env(monkeypatch)
+    monkeypatch.setenv("CORRESPONDENT_BACKFILL_BATCH_SIZE", "5")
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.find_without_correspondent.return_value = []
+
+        correspondent_backfill_flow()
+
+        assert mock_enrich.find_without_correspondent.call_args.args[-1] == 5
+
+
+def test_backfill_fails_the_run_when_every_document_failed(monkeypatch):
+    """Nothing here pushes a metric series, so a run that lost its whole batch
+    must not finish Completed and read as progress."""
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.find_without_correspondent.return_value = [1, 2]
+        mock_task.side_effect = ValueError("ollama down")
+
+        with pytest.raises(RuntimeError):
+            correspondent_backfill_flow(batch_size=2)
+
+        assert mock_task.call_count == 2
+
+
+def test_backfill_skipped_when_a_previous_run_is_still_running(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.side_effect = TimeoutError
+        mock_concurrency.return_value.__exit__.return_value = False
+
+        correspondent_backfill_flow(batch_size=3)
+
+        mock_concurrency.assert_called_once_with(
+            "correspondent-backfill", occupy=1, timeout_seconds=10
+        )
+        mock_enrich.find_without_correspondent.assert_not_called()
+        mock_task.assert_not_called()
+
+
+def test_backfill_passes_dry_run_through_to_every_document(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.resolve_declined_tag.return_value = 11
+        mock_enrich.find_without_correspondent.return_value = [1, 2]
+        mock_task.side_effect = [_backfill_result(1), _backfill_result(2)]
+
+        correspondent_backfill_flow(batch_size=2, dry_run=True)
+
+        assert [c.args for c in mock_task.call_args_list] == [(1, 11, True), (2, 11, True)]
