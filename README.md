@@ -20,6 +20,7 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 | `scan` | `0 * * * *` (`SCAN_CRON`) | `process_scans` → `push_scan_metrics` |
 | `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
 | `enrich-sweep` | `0 * * * *` (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
+| `correspondent-backfill` | none unless `CORRESPONDENT_BACKFILL_CRON` | `find_without_correspondent` → `backfill_correspondent` per document |
 
 ## HTTP API (port `8080`)
 
@@ -180,6 +181,38 @@ Two things exist for the backfill specifically:
   flow-run parameter, not an env var, deliberately — the sweep's steady-state job
   is catching dropped triggers, and a dry-run default would silently disable it.
 
+### Correspondent backfill
+
+`correspondent-backfill` covers the complementary set: documents that already
+carry the `ai-processed` marker but have no correspondent — everything enriched
+before the dedicated correspondent query existed, plus every document that query
+has since declined (~15–25% of the sweep's output: forms and certificates with no
+obvious issuer). It skips `ai_suggestions` entirely and runs only the
+correspondent query, then a PATCH that carries **only** the correspondent, so
+titles (some curated) and tags are byte-identical before and after. Created
+correspondents are unowned, same as in enrich.
+
+Two things differ from the sweep, and both exist because here the correspondent
+*is* the job rather than a bonus on top of the title:
+
+- **A decline is terminal.** When the model answers with an empty string, or the
+  document is under the OCR floor and there is nothing to ask about, the
+  document is tagged `no-correspondent`. Without that it would match
+  `correspondent__isnull` again every run, forever. A tag rather than a record in
+  the results JSONL because it is visible in the paperless UI (assigning one by
+  hand there drops the document out of the query on its own) and survives
+  losing the state PVC.
+- **A query failure raises instead of declining.** The sweep folds an Ollama
+  error into "no correspondent" because the title outranks it; here that would
+  tag a document `no-correspondent` on a transient timeout and lose it for good.
+  The task retries, the document stays unmarked, and a run that lost its whole
+  batch fails rather than finishing `Completed`.
+
+Each PATCH renames the file to the `<created>_<correspondent>_<title>` format,
+which is the point — and also why the cron is offset from the sweep's and
+batched to the same memory budget: it is a slow rolling rename over the
+library, paced by the `ollama` slot and the model's keep-alive.
+
 Harvest the vocabulary the corpus asked for from the results JSONL:
 
 ```bash
@@ -213,6 +246,8 @@ already exist — so those names have to be created before matching can ever fir
 | `ENRICH_OLLAMA_URL` | no | unset → dedicated title/correspondent queries off | Ollama base URL for the queries enrich runs itself |
 | `ENRICH_OLLAMA_MODEL` | no | unset → dedicated title/correspondent queries off | Model for those queries |
 | `ENRICH_FALLBACK_TIMEOUT` | no | `300` | Read timeout for the dedicated Ollama queries, in seconds |
+| `CORRESPONDENT_BACKFILL_CRON` | no | unset → backfill has no schedule | Cron for the `correspondent-backfill` deployment (registered only when the Ollama vars are set) |
+| `CORRESPONDENT_BACKFILL_BATCH_SIZE` | no | `8` | Documents per backfill run |
 | `ENRICH_RESULTS_PATH` | no | `/state/enrich/results.jsonl` | Per-document enrichment result log |
 | `PREFECT_LOGGING_EXTRA_LOGGERS` | no | unset → module logs stay out of the Prefect UI | Set to `document_pipeline` to route module logs into flow run logs |
 

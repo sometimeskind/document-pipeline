@@ -242,3 +242,103 @@ def _run_sweep(batch_size: int, dry_run: bool) -> None:
             push_enrich_metrics_task(document_id, succeeded=False)
 
     logger.info("enrich-sweep: %d processed, %d failed", enriched, failed)
+
+
+@task(
+    name="backfill-correspondent", retries=2, retry_delay_seconds=[60, 300], log_prints=True
+)
+def backfill_correspondent_task(
+    document_id: int, declined_id: int, dry_run: bool = False
+) -> enrich.EnrichResult:
+    """Assign a correspondent to one already-enriched document, or mark it declined.
+
+    The retries are what make the terminal marker safe: the Ollama query raises
+    on failure rather than reporting "no correspondent", so a timeout gets
+    re-asked instead of tagging the document `no-correspondent` for good.
+    """
+    logger = get_run_logger()
+    paperless_url = os.environ["PAPERLESS_URL"]
+    with enrich.open_client(_paperless_admin_token()) as client:
+        result = enrich.backfill_correspondent(
+            client, paperless_url, document_id, declined_id, dry_run=dry_run
+        )
+
+    enrich.append_result(result)
+    logger.info(
+        "backfill-correspondent %s complete in %.2fs: %s",
+        document_id, result.duration_seconds, result.outcome,
+    )
+    return result
+
+
+@flow(name="correspondent-backfill", log_prints=True)
+def correspondent_backfill_flow(batch_size: int | None = None, dry_run: bool = False) -> None:
+    """Assign correspondents to enriched documents that have none (#1373).
+
+    Shaped like enrich_sweep_flow, over the complementary set: documents that
+    DO carry the `ai-processed` marker but no correspondent — everything
+    enriched before the #1366 fallback, plus every document the sweep's
+    fallback has declined since. Each is asked once more; a decline here is
+    terminal (`no-correspondent` tag), so the set drains instead of cycling.
+
+    Same memory budget as the sweep (see ENRICH_SWEEP_BATCH_SIZE in the cluster
+    manifest): its cron is offset from the sweep's so each batch runs against a
+    freshly loaded model, and the `ollama` slot serializes any overlap.
+    """
+    logger = get_run_logger()
+    flow_started = time.perf_counter()
+    slot_acquired = False
+    if batch_size is None:
+        batch_size = int(os.environ.get("CORRESPONDENT_BACKFILL_BATCH_SIZE", "8"))
+
+    try:
+        with concurrency("correspondent-backfill", occupy=1, timeout_seconds=10):
+            slot_acquired = True
+            _run_backfill(batch_size, dry_run)
+        logger.info(
+            "correspondent-backfill complete in %.2fs", time.perf_counter() - flow_started
+        )
+    except TimeoutError:
+        if not slot_acquired:
+            logger.info("Skipped — correspondent backfill already running")
+        else:
+            raise
+
+
+def _run_backfill(batch_size: int, dry_run: bool) -> None:
+    logger = get_run_logger()
+    paperless_url = os.environ["PAPERLESS_URL"]
+    with enrich.open_client(_paperless_admin_token()) as client:
+        marker_id = enrich.resolve_marker_tag(client, paperless_url)
+        declined_id = enrich.resolve_declined_tag(client, paperless_url)
+        document_ids = enrich.find_without_correspondent(
+            client, paperless_url, marker_id, declined_id, batch_size
+        )
+
+    logger.info(
+        "correspondent-backfill: %d document(s) without a correspondent, batch size %d%s",
+        len(document_ids), batch_size, " (DRY RUN — nothing will be written)" if dry_run else "",
+    )
+    assigned = declined = failed = 0
+    for document_id in document_ids:
+        try:
+            with concurrency("ollama", occupy=1):
+                result = backfill_correspondent_task(document_id, declined_id, dry_run)
+        except Exception as exc:
+            # Per-document isolation, as in the sweep — and nothing is marked
+            # on failure, so the next run asks again.
+            logger.error("correspondent-backfill: document %s failed: %s", document_id, exc)
+            failed += 1
+            continue
+        if result.correspondent:
+            assigned += 1
+        elif result.outcome != "already-has-correspondent":
+            declined += 1
+
+    logger.info(
+        "correspondent-backfill: %d assigned, %d declined, %d failed", assigned, declined, failed
+    )
+    if document_ids and failed == len(document_ids):
+        # Nothing here pushes a metric series, so a run that lost every
+        # document must not finish Completed and look like progress.
+        raise RuntimeError(f"correspondent-backfill: all {failed} document(s) failed")

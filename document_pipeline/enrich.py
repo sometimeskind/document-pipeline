@@ -47,6 +47,14 @@ CONSUME_TITLE_CHARS = 127
 # replayed trigger cheap.
 MARKER_TAG = "ai-processed"
 
+# The correspondent backfill's terminal marker (#1373): applied when the model
+# finds no clear issuer, or there is no OCR text to ask about. Without it every
+# declined document would match `correspondent__isnull` again next hour and be
+# re-queried forever. A tag rather than a record in the results JSONL because
+# it is visible in the paperless UI (a hand-assigned correspondent drops the
+# document out of the query on its own) and survives losing the state PVC.
+NO_CORRESPONDENT_TAG = "no-correspondent"
+
 # `ai_suggestions` is one request that runs TWO Ollama queries: a classification
 # query, then a localization query because PAPERLESS_AI_LLM_OUTPUT_LANGUAGE is
 # set. So this must exceed twice PAPERLESS_AI_LLM_REQUEST_TIMEOUT (300s). The
@@ -110,18 +118,21 @@ def patch_document(
     client: httpx.Client,
     paperless_url: str,
     document_id: int,
-    tags: list[int],
+    tags: list[int] | None = None,
     title: str | None = None,
     correspondent: int | None = None,
 ) -> None:
-    """Write back tags, and the title only when we have one to write.
+    """Write back whichever of tags, title and correspondent we have to write.
 
     Omitting `title` is what keeps the short-content path from rewriting a title
     it never generated — it still gets the marker so the sweep stops picking it.
     Same rule for `correspondent`: None means "leave whatever is there alone",
-    never "clear it".
+    never "clear it". And for `tags`, which the correspondent backfill omits so
+    that a PATCH assigning only a correspondent cannot touch the tag list.
     """
-    payload: dict[str, object] = {"tags": tags}
+    payload: dict[str, object] = {}
+    if tags is not None:
+        payload["tags"] = tags
     if title is not None:
         payload["title"] = title
     if correspondent is not None:
@@ -259,44 +270,63 @@ TITLE_SCHEMA = {
 }
 
 
-def _ollama_field(prompt: str, schema: dict, field: str, max_chars: int) -> str | None:
-    """Ask Ollama for one schema-required string field. None on any failure.
+def _ollama_config() -> tuple[str, str] | None:
+    """(url, model), or None when either env var is unset.
 
-    Unconfigured (either env var missing) means off — the image can land
-    before the manifest that configures it, same reasoning as the token
-    fallback in flow.py. Callers treat None as "fall back", so every error
-    degrades with a warning rather than raising.
+    Unconfigured means off — the image can land before the manifest that
+    configures it, same reasoning as the token fallback in flow.py.
     """
     url = os.environ.get("ENRICH_OLLAMA_URL")
     model = os.environ.get("ENRICH_OLLAMA_MODEL")
     if not url or not model:
         return None
+    return url, model
 
+
+def _query_ollama(
+    config: tuple[str, str], prompt: str, schema: dict, field: str, max_chars: int
+) -> str | None:
+    """Ask Ollama for one schema-required string field.
+
+    Raises on any transport, HTTP or parse failure. None means only that the
+    model answered with an empty string — the schema requires the field, so an
+    empty string is its one way of saying "nothing here".
+    """
+    url, model = config
+    resp = httpx.post(
+        f"{url.rstrip('/')}/api/chat",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "format": schema,
+            "options": {"num_ctx": FALLBACK_NUM_CTX},
+        },
+        timeout=httpx.Timeout(
+            30.0,
+            read=float(os.environ.get("ENRICH_FALLBACK_TIMEOUT", DEFAULT_FALLBACK_TIMEOUT)),
+        ),
+    )
+    resp.raise_for_status()
+    raw = json.loads(resp.json()["message"]["content"])
+    value = " ".join(str(raw.get(field) or "").split())[:max_chars]
+    return value or None
+
+
+def _ollama_field(prompt: str, schema: dict, field: str, max_chars: int) -> str | None:
+    """`_query_ollama`, degraded: None on unconfigured and on any failure.
+
+    Callers treat None as "fall back", so every error degrades with a warning
+    rather than raising.
+    """
+    config = _ollama_config()
+    if config is None:
+        return None
     try:
-        resp = httpx.post(
-            f"{url.rstrip('/')}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "format": schema,
-                "options": {"num_ctx": FALLBACK_NUM_CTX},
-            },
-            timeout=httpx.Timeout(
-                30.0,
-                read=float(
-                    os.environ.get("ENRICH_FALLBACK_TIMEOUT", DEFAULT_FALLBACK_TIMEOUT)
-                ),
-            ),
-        )
-        resp.raise_for_status()
-        raw = json.loads(resp.json()["message"]["content"])
+        return _query_ollama(config, prompt, schema, field, max_chars)
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         logger.warning("Ollama %s query failed: %s", field, exc)
         return None
-
-    value = " ".join(str(raw.get(field) or "").split())[:max_chars]
-    return value or None
 
 
 def extract_correspondent_fallback(content: str) -> str | None:
@@ -307,6 +337,25 @@ def extract_correspondent_fallback(content: str) -> str | None:
     """
     prompt = CORRESPONDENT_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
     return _ollama_field(prompt, CORRESPONDENT_SCHEMA, "correspondent", MAX_CORRESPONDENT_CHARS)
+
+
+def extract_correspondent(content: str) -> str | None:
+    """Ask Ollama who issued the document. Raises on any failure.
+
+    The backfill's variant of `extract_correspondent_fallback`, which folds
+    failure into None because the title outranks the correspondent there. Here
+    the correspondent IS the job, and a document marked `no-correspondent` on a
+    transient Ollama timeout would be lost to the backfill for good. So a
+    failure raises for Prefect to retry, and None means exactly one thing: the
+    model found no clear issuer.
+    """
+    config = _ollama_config()
+    if config is None:
+        raise RuntimeError("ENRICH_OLLAMA_URL and ENRICH_OLLAMA_MODEL must both be set")
+    prompt = CORRESPONDENT_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
+    return _query_ollama(
+        config, prompt, CORRESPONDENT_SCHEMA, "correspondent", MAX_CORRESPONDENT_CHARS
+    )
 
 
 def extract_title(content: str) -> str | None:
@@ -323,6 +372,30 @@ def find_unenriched(
         f"{paperless_url}/api/documents/",
         params={
             "tags__id__none": marker_id,
+            "page_size": limit,
+            "ordering": "id",
+            "fields": "id",
+        },
+    )
+    resp.raise_for_status()
+    return [int(r["id"]) for r in resp.json().get("results") or []]
+
+
+def find_without_correspondent(
+    client: httpx.Client, paperless_url: str, marker_id: int, declined_id: int, limit: int
+) -> list[int]:
+    """Ids of enriched documents with no correspondent and no decline marker, oldest first.
+
+    Enriched only (`ai-processed`): everything still unenriched gets its
+    correspondent inline from the sweep as it reaches it, so touching it here
+    would do that query twice.
+    """
+    resp = client.get(
+        f"{paperless_url}/api/documents/",
+        params={
+            "tags__id__all": marker_id,
+            "tags__id__none": declined_id,
+            "correspondent__isnull": "true",
             "page_size": limit,
             "ordering": "id",
             "fields": "id",
@@ -492,8 +565,94 @@ def enrich_document(
     )
 
 
+def backfill_correspondent(
+    client: httpx.Client,
+    paperless_url: str,
+    document_id: int,
+    declined_id: int,
+    *,
+    dry_run: bool = False,
+) -> EnrichResult:
+    """Assign a correspondent to one already-enriched document, or mark it declined.
+
+    Documents enriched before the #1366 fallback have a title but no
+    correspondent, so their filenames never gain the sender's name (#1373).
+    This is the correspondent-only pass over them: no `ai_suggestions` (the
+    paperless pass is known-dry, and this must never touch the title — some are
+    curated), just the dedicated Ollama query and a PATCH that carries ONLY the
+    correspondent. The decline PATCH carries only the tags, with the existing
+    ones merged back in — same rule as `merge_tags`.
+
+    `dry_run` reports the name without creating or writing anything, and so
+    re-reports the same documents every time — a sample, as in the sweep.
+    """
+    started = time.perf_counter()
+
+    document = fetch_document(client, paperless_url, document_id)
+    if document.get("correspondent") is not None:
+        # The sweep or a hand edit got there between the query and now.
+        logger.info("Document %s already has a correspondent, skipping", document_id)
+        return EnrichResult(
+            document_id=document_id,
+            outcome="already-has-correspondent",
+            duration_seconds=time.perf_counter() - started,
+        )
+
+    existing_tags = [int(t) for t in document.get("tags") or []]
+    content = document.get("content") or ""
+    content_length = len(content.strip())
+    if content_length < MIN_CONTENT_CHARS:
+        # The sweep marks these `ai-processed` without titling them, so they
+        # land in this query too. Nothing to ask about — mark, don't query.
+        logger.info(
+            "Document %s has only %d chars of OCR content (min %d) — no correspondent",
+            document_id, content_length, MIN_CONTENT_CHARS,
+        )
+        name = None
+        outcome = "skipped-short-content"
+    else:
+        name = extract_correspondent(content)
+        outcome = "backfilled" if name else "declined"
+
+    if name is None:
+        if not dry_run:
+            patch_document(
+                client, paperless_url, document_id, merge_tags(existing_tags, [], declined_id)
+            )
+        logger.info("Document %s: no correspondent found%s", document_id,
+                    " (DRY RUN)" if dry_run else f" — tagged {NO_CORRESPONDENT_TAG!r}")
+        return EnrichResult(
+            document_id=document_id,
+            outcome=outcome,
+            duration_seconds=time.perf_counter() - started,
+        )
+
+    if dry_run:
+        logger.info("Document %s WOULD get correspondent %r", document_id, name)
+        return EnrichResult(
+            document_id=document_id,
+            outcome="dry-run",
+            correspondent=name,
+            duration_seconds=time.perf_counter() - started,
+        )
+
+    correspondent_id = resolve_correspondent(client, paperless_url, name)
+    patch_document(client, paperless_url, document_id, correspondent=correspondent_id)
+    logger.info("Document %s assigned correspondent %r", document_id, name)
+    return EnrichResult(
+        document_id=document_id,
+        outcome=outcome,
+        correspondent=name,
+        duration_seconds=time.perf_counter() - started,
+    )
+
+
 def resolve_marker_tag(client: httpx.Client, paperless_url: str) -> int:
     return resolve_tag(client, paperless_url, MARKER_TAG)
+
+
+def resolve_declined_tag(client: httpx.Client, paperless_url: str) -> int:
+    return resolve_tag(client, paperless_url, NO_CORRESPONDENT_TAG)
 
 
 def append_result(result: EnrichResult, path: str | None = None) -> None:
