@@ -433,3 +433,20 @@ def test_backfill_passes_dry_run_through_to_every_document(monkeypatch):
         correspondent_backfill_flow(batch_size=2, dry_run=True)
 
         assert [c.args for c in mock_task.call_args_list] == [(1, 11, True), (2, 11, True)]
+
+
+def test_paperless_health_flow_probes_with_the_admin_token_and_pushes(monkeypatch):
+    from document_pipeline.flow import paperless_health_flow
+    from document_pipeline.paperless_health import TaskQueueHealth
+    monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
+    monkeypatch.setenv("PAPERLESS_API_TOKEN", "ingest-tok")
+    monkeypatch.setenv("PAPERLESS_ADMIN_TOKEN", "superuser-tok")
+
+    with patch("document_pipeline.flow.paperless_health") as mock_probe, \
+         patch("document_pipeline.flow.metrics") as mock_metrics:
+        mock_probe.probe.return_value = TaskQueueHealth(failed=2, oldest_unfinished_seconds=901.0)
+
+        paperless_health_flow()
+
+    mock_probe.probe.assert_called_once_with("http://paperless", "superuser-tok")
+    mock_metrics.push_paperless_health_metrics.assert_called_once_with(2, 901.0)

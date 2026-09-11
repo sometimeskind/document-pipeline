@@ -27,6 +27,11 @@ _REQUIRED_SCAN = ("WEBDAV_USERNAME", "WEBDAV_PASSWORD")
 # worst case at an hour.
 _DEFAULT_SCAN_CRON = "0 * * * *"
 
+# Task-queue probe (homelab#1589). Five minutes bounds how late a failed
+# consume or a starved worker is noticed; the alert on the pushed timestamp
+# expects a push at least every 15.
+_DEFAULT_PAPERLESS_HEALTH_CRON = "*/5 * * * *"
+
 
 def _print_vocab() -> None:
     """Frequency-ranked tag names the model proposed that matched nothing.
@@ -74,6 +79,7 @@ def main() -> None:
         enrich_flow,
         enrich_sweep_flow,
         mail_flow,
+        paperless_health_flow,
         scan_flow,
     )
     from document_pipeline.prefect_client import ensure_concurrency_limits
@@ -126,12 +132,18 @@ def main() -> None:
             )
         )
 
+    paperless_health_cron = os.environ.get("PAPERLESS_HEALTH_CRON", _DEFAULT_PAPERLESS_HEALTH_CRON)
+    deployments.append(
+        paperless_health_flow.to_deployment(name="paperless-health", cron=paperless_health_cron)
+    )
+
     logger.info(
         "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s, ENRICH_SWEEP_CRON=%s, "
-        "CORRESPONDENT_BACKFILL_CRON=%s)",
+        "CORRESPONDENT_BACKFILL_CRON=%s, PAPERLESS_HEALTH_CRON=%s)",
         fetch_cron or "disabled",
         scan_cron if scan_enabled else "disabled",
         enrich_sweep_cron or "disabled",
         (backfill_cron or "unscheduled") if backfill_enabled else "disabled",
+        paperless_health_cron,
     )
     prefect_serve(*deployments)
