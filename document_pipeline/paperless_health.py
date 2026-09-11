@@ -34,6 +34,13 @@ def probe(paperless_url: str, paperless_token: str) -> TaskQueueHealth:
     UI is what clears it. The unfinished age spans every task type: a starved
     worker stalls whatever is queued, so a scheduled task sitting in PENDING
     is the same signal as a consume doing so.
+
+    Both queries skip acknowledged tasks. That is the operator's escape hatch
+    in either direction: the failed backlog is dismissed in the Paperless UI
+    once handled, and a task record left in PENDING/STARTED forever by a pod
+    killed mid-run (the first live probe found one 110 days old) is dismissed
+    the same way — Paperless never finalises it, so the age would otherwise
+    ratchet the stalled-queue alert on for good.
     """
     with httpx.Client(
         headers={"Authorization": f"Token {paperless_token}"}, timeout=TIMEOUT
@@ -44,7 +51,7 @@ def probe(paperless_url: str, paperless_token: str) -> TaskQueueHealth:
         )["count"]
         unfinished = _tasks(
             client, paperless_url,
-            status=["pending", "started"], ordering="date_created",
+            status=["pending", "started"], acknowledged="false", ordering="date_created",
         )["results"]
 
     oldest = 0.0
