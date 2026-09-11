@@ -20,7 +20,7 @@ from document_pipeline import paperless_health
 PAPERLESS = "http://paperless"
 
 
-def _task(status, *, created_ago=0, acknowledged=False, task_type="consume_file"):
+def _task(status, *, created_ago=0, acknowledged=False, task_type="consume_file", result_data=None):
     created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=created_ago)
     return {
         "id": 1,
@@ -28,6 +28,7 @@ def _task(status, *, created_ago=0, acknowledged=False, task_type="consume_file"
         "status": status,
         "acknowledged": acknowledged,
         "date_created": created.isoformat(),
+        "result_data": result_data,
     }
 
 
@@ -93,13 +94,23 @@ def test_finished_tasks_are_ignored():
 
 
 @respx.mock
-def test_probe_sends_the_token_and_pages_of_one():
+def test_duplicate_rejections_are_not_failures():
+    # Since 3.1 a duplicate upload is recorded as a failed task with
+    # duplicate_of set; the scan flow treats it as success, so must the probe.
+    _fake_tasks_api([_task("failure", result_data={"duplicate_of": 3903}), _task("failure", result_data={})])
+    assert paperless_health.probe(PAPERLESS, "tok").failed == 1
+
+
+@respx.mock
+def test_probe_sends_the_token_and_pages_sensibly():
     route = _fake_tasks_api([])
     paperless_health.probe(PAPERLESS, "tok")
     assert route.call_count == 2
     for call in route.calls:
         assert call.request.headers["Authorization"] == "Token tok"
-        assert call.request.url.params["page_size"] == "1"
+    failed_call, unfinished_call = route.calls
+    assert failed_call.request.url.params["page_size"] == "100"  # walks the list, filters result_data
+    assert unfinished_call.request.url.params["page_size"] == "1"  # only the oldest row is needed
 
 
 @respx.mock
