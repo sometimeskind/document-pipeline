@@ -8,7 +8,7 @@ import time
 from prefect import flow, get_run_logger, task
 from prefect.concurrency.sync import concurrency
 
-from document_pipeline import enrich, extract, imap_client, metrics, scan, webdav
+from document_pipeline import enrich, extract, imap_client, metrics, paperless_health, scan, webdav
 
 
 @task(name="process-mail", log_prints=True)
@@ -342,3 +342,30 @@ def _run_backfill(batch_size: int, dry_run: bool) -> None:
         # Nothing here pushes a metric series, so a run that lost every
         # document must not finish Completed and look like progress.
         raise RuntimeError(f"correspondent-backfill: all {failed} document(s) failed")
+
+
+@task(name="probe-paperless-health", log_prints=True)
+def probe_paperless_health_task() -> paperless_health.TaskQueueHealth:
+    return paperless_health.probe(os.environ["PAPERLESS_URL"], _paperless_admin_token())
+
+
+@task(name="push-paperless-health-metrics", log_prints=True)
+def push_paperless_health_metrics_task(health: paperless_health.TaskQueueHealth) -> None:
+    metrics.push_paperless_health_metrics(health.failed, health.oldest_unfinished_seconds)
+
+
+@flow(name="paperless-health", log_prints=True)
+def paperless_health_flow() -> None:
+    """Two reads of the tasks API and a push (homelab#1589).
+
+    No concurrency slot and no retries, deliberately: a run that fails leaves
+    `paperless_health_last_success_timestamp` where it was, and the
+    PaperlessHealthProbeDead rule is what turns that into a page.
+    """
+    logger = get_run_logger()
+    health = probe_paperless_health_task()
+    push_paperless_health_metrics_task(health)
+    logger.info(
+        "paperless-health: %d unacknowledged failed consume task(s), oldest unfinished task %.0fs",
+        health.failed, health.oldest_unfinished_seconds,
+    )

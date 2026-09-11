@@ -21,6 +21,7 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
 | `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
 | `enrich-sweep` | `0 * * * *` (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
 | `correspondent-backfill` | none unless `CORRESPONDENT_BACKFILL_CRON` | `find_without_correspondent` → `backfill_correspondent` per document |
+| `paperless-health` | `*/5 * * * *` (`PAPERLESS_HEALTH_CRON`) | `probe_paperless_health` → `push_paperless_health_metrics` |
 
 ## HTTP API (port `8080`)
 
@@ -222,6 +223,24 @@ kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline voc
 Tagging cannot bootstrap itself — `match_tags_by_name` only matches tags that
 already exist — so those names have to be created before matching can ever fire.
 
+## Paperless task-queue health (`paperless-health` flow)
+
+Paperless exposes no metrics, but its `/api/tasks/` is the source of truth for
+the two faults that stayed invisible in homelab#1589 — a consume that failed
+(silently, on the mail path, which only POSTs) and a starved celery worker
+leaving tasks queued for hours. Every five minutes the flow reads it with the
+admin token (the one with `view_paperlesstask`) and pushes, under the
+`paperless-health` job:
+
+- `paperless_tasks_failed` — unacknowledged `consume_file` tasks in `failure`.
+  Acknowledging the task in the Paperless UI is what clears it.
+- `paperless_task_oldest_unfinished_seconds` — age of the oldest task of any
+  type still `pending` or `started`, 0 when none.
+- `paperless_health_last_success_timestamp` — so a dead probe is itself loud.
+
+Two page-of-one queries (`count` for the first, `ordering=date_created` for
+the second) rather than a walk over the task list.
+
 ## Environment variables
 
 | Variable | Required | Default | Purpose |
@@ -248,6 +267,7 @@ already exist — so those names have to be created before matching can ever fir
 | `ENRICH_FALLBACK_TIMEOUT` | no | `300` | Read timeout for the dedicated Ollama queries, in seconds |
 | `CORRESPONDENT_BACKFILL_CRON` | no | unset → backfill has no schedule | Cron for the `correspondent-backfill` deployment (registered only when the Ollama vars are set) |
 | `CORRESPONDENT_BACKFILL_BATCH_SIZE` | no | `8` | Documents per backfill run |
+| `PAPERLESS_HEALTH_CRON` | no | `*/5 * * * *` | Cron for the `paperless-health` deployment |
 | `ENRICH_RESULTS_PATH` | no | `/state/enrich/results.jsonl` | Per-document enrichment result log |
 | `PREFECT_LOGGING_EXTRA_LOGGERS` | no | unset → module logs stay out of the Prefect UI | Set to `document_pipeline` to route module logs into flow run logs |
 

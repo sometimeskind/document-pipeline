@@ -193,6 +193,41 @@ def push_enrich_metrics(document_id: int, succeeded: bool) -> None:
     _pushadd(url, "paperless_autotitle", registry)
 
 
+def push_paperless_health_metrics(failed: int, oldest_unfinished_seconds: float) -> None:
+    """Push the task-queue probe (homelab#1589). No-op when PUSHGATEWAY_URL is unset.
+
+    Its own job, replaced whole on every run like the mail and scan groups.
+    The timestamp is what makes a dead probe loud: the other two gauges only
+    ever say "fine" or "broken", so without it a probe that stopped running
+    would look like a queue that stopped failing.
+    """
+    url = os.environ.get("PUSHGATEWAY_URL", "")
+    if not url:
+        return
+
+    registry = CollectorRegistry()
+
+    Gauge(
+        "paperless_health_last_success_timestamp",
+        "Unix timestamp of the last successful paperless-health probe",
+        registry=registry,
+    ).set(time.time())
+    Gauge(
+        "paperless_tasks_failed",
+        "Number of unacknowledged failed Paperless consume tasks",
+        registry=registry,
+    ).set(failed)
+    # An age rather than a timestamp, as for scan: an empty queue pushes 0 and
+    # the stalled-queue alert resolves itself.
+    Gauge(
+        "paperless_task_oldest_unfinished_seconds",
+        "Age of the oldest Paperless task still pending or started, 0 when none",
+        registry=registry,
+    ).set(oldest_unfinished_seconds)
+
+    _push(url, "paperless-health", registry)
+
+
 def _push(url: str, job: str, registry: CollectorRegistry) -> None:
     try:
         push_to_gateway(url, job=job, registry=registry, timeout=10)
