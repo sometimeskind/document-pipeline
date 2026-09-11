@@ -8,36 +8,67 @@ import time
 from prefect import flow, get_run_logger, task
 from prefect.concurrency.sync import concurrency
 
-from document_pipeline import enrich, extract, imap_client, metrics, paperless_health, scan, webdav
+from document_pipeline import (
+    enrich, extract, imap_client, metrics, paperless_health, prefect_client, scan, webdav,
+)
 
 
 @task(name="process-mail", log_prints=True)
 def process_mail_task() -> tuple[int, int]:
-    """Fetch unprocessed messages from IMAP, submit PDFs, mark processed.
+    """Fetch unprocessed messages from IMAP, queue their PDFs, mark processed.
 
-    Returns (messages_processed, pdfs_submitted).
+    PDFs go into the `mail/` directory of the WebDAV scan queue, not to
+    Paperless directly: the scan flow drains that queue and is what follows
+    each file to a terminal consume state (homelab#1590). A message is flagged
+    `$Processed` only once every PUT for it succeeded; a failed PUT leaves it
+    unflagged and it is retried next run, where the UID-prefixed object names
+    make the retry overwrite rather than duplicate.
+
+    Returns (messages_processed, pdfs_queued).
     """
     logger = get_run_logger()
     started = time.perf_counter()
 
+    queue_path = scan.source_path(os.environ.get("WEBDAV_SCAN_PATH", "/"), "mail")
     with imap_client.open_inbox() as conn:
         messages = imap_client.fetch_unprocessed(conn)
         logger.info("process-mail: %d unprocessed message(s)", len(messages))
-        pdfs_submitted = 0
+        pdfs_queued = 0
+        failed = 0
+        queue = _webdav_client()
+        if messages:
+            queue.mkcol(queue_path)
         for uid, msg in messages:
-            if extract.submit_message_pdfs(
-                msg,
-                paperless_url=os.environ["PAPERLESS_URL"],
-                paperless_token=os.environ["PAPERLESS_API_TOKEN"],
-            ):
-                pdfs_submitted += 1
+            try:
+                pdfs_queued += extract.queue_message_pdfs(msg, uid.decode(), queue, queue_path)
+            except Exception as exc:
+                # Per-message isolation, and no flag: the next run retries it.
+                logger.error("process-mail: message %s left unflagged, PUT failed: %s", uid.decode(), exc)
+                failed += 1
+                continue
             imap_client.mark_processed(conn, uid)
 
+    if pdfs_queued:
+        # The hop into Paperless is the scan flow's; trigger it now rather than
+        # waiting for its hourly sweep. Coalesced exactly like /trigger-scan.
+        if not prefect_client.has_active_scan_run() and not prefect_client.trigger_scan():
+            logger.warning("process-mail: could not trigger a scan run — the hourly sweep will drain the queue")
+
     logger.info(
-        "process-mail complete in %.2fs: %d message(s), %d PDF(s) submitted",
-        time.perf_counter() - started, len(messages), pdfs_submitted,
+        "process-mail complete in %.2fs: %d message(s), %d PDF(s) queued, %d message(s) failed",
+        time.perf_counter() - started, len(messages), pdfs_queued, failed,
     )
-    return len(messages), pdfs_submitted
+    if failed:
+        raise RuntimeError(f"process-mail: {failed} message(s) could not be queued and stay unflagged")
+    return len(messages), pdfs_queued
+
+
+def _webdav_client() -> webdav.WebDAVClient:
+    return webdav.WebDAVClient(
+        base_url=os.environ["WEBDAV_URL"],
+        username=os.environ["WEBDAV_USERNAME"],
+        password=os.environ["WEBDAV_PASSWORD"],
+    )
 
 
 @task(name="push-metrics", log_prints=True)
@@ -65,17 +96,12 @@ def mail_flow() -> None:
 
 @task(name="process-scans", log_prints=True)
 def process_scans_task() -> scan.ScanResult:
-    """Drain the scanner's WebDAV directory into Paperless."""
+    """Drain the WebDAV scan queue — scanner root and `mail/` — into Paperless."""
     logger = get_run_logger()
     started = time.perf_counter()
 
-    client = webdav.WebDAVClient(
-        base_url=os.environ["WEBDAV_URL"],
-        username=os.environ["WEBDAV_USERNAME"],
-        password=os.environ["WEBDAV_PASSWORD"],
-    )
     result = scan.ingest_scans(
-        client,
+        _webdav_client(),
         scan_path=os.environ.get("WEBDAV_SCAN_PATH", "/"),
         paperless_url=os.environ["PAPERLESS_URL"],
         paperless_token=os.environ["PAPERLESS_API_TOKEN"],
@@ -90,9 +116,7 @@ def process_scans_task() -> scan.ScanResult:
 
 @task(name="push-scan-metrics", log_prints=True)
 def push_scan_metrics_task(result: scan.ScanResult, duration_seconds: float) -> None:
-    metrics.push_scan_metrics(
-        result.ingested, result.failed, result.pending, result.oldest_pending_age_seconds, duration_seconds
-    )
+    metrics.push_scan_metrics(result.sources, duration_seconds)
 
 
 @flow(name="scan", log_prints=True)

@@ -7,16 +7,29 @@ Proton ↔ Bridge ↔ mbsync ↔ /maildir ↔ Dovecot ↔ Thunderbird (or any IM
                               ↓
                            notmuch
                               ↓
-                       extract PDFs → Paperless
+                extract PDFs → WebDAV scan queue (mail/)
+                              ↓
+                   scan flow → Paperless (polled to a terminal state)
                               ↓
                          push metrics → Pushgateway
 ```
+
+The mail flow never talks to Paperless itself. Each PDF attachment is PUT into
+the `mail/` directory of the same WebDAV share the scanner writes to, named
+`<imap-uid>-<sanitised-filename>.pdf`, and the message is flagged `$Processed`
+only once every PUT for it succeeded — a failed PUT leaves it unflagged, the
+next run retries, and the UID prefix makes that retry overwrite rather than
+duplicate. The flow then triggers a `scan` run in-process (coalesced like
+`/trigger-scan`), and the scan flow's poll-then-delete contract below is what
+follows the file into Paperless. That is the point (homelab#1590): a consume
+that fails is left in `mail/` and alerted on, instead of being a 2xx the mail
+flow took for done.
 
 `mbsync` is **bidirectional**. New mail flows down from Proton; local changes (deletes, moves, flag/Seen changes made by a mail client through Dovecot) flow back up. A single long-running container runs a Prefect flow on event-driven triggers from the cluster (with a cron-backstop) and exposes a small HTTP API for health probes and on-demand triggers — see [Trigger architecture](#trigger-architecture).
 
 | Flow | Backstop schedule | Tasks |
 |---|---|---|
-| `mail` | `*/5 * * * *` (`FETCH_CRON`) | `sync_mail` → `index_mail` → `extract_pdfs` → `push_metrics` |
+| `mail` | `*/5 * * * *` (`FETCH_CRON`) | `process_mail` (queue PDFs into `mail/`, flag `$Processed`, trigger `scan`) → `push_metrics` |
 | `scan` | `0 * * * *` (`SCAN_CRON`) | `process_scans` → `push_scan_metrics` |
 | `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
 | `enrich-sweep` | `0 * * * *` (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
@@ -99,14 +112,24 @@ Local changes (Thunderbird → Dovecot → `/maildir`) propagate to Proton when 
 
 ## Scan ingestion (`scan` flow)
 
-A network scanner writes straight to a WebDAV share; the `scan` flow drains that
-share into Paperless and removes each file once Paperless confirms it landed.
+A network scanner writes straight to a WebDAV share, and the `mail` flow queues
+PDF attachments into `mail/` beneath it; the `scan` flow drains both into
+Paperless and removes each file once Paperless confirms it landed.
 
 ```
-Brother MFC ──WebDAV──> Davis ──inotify sidecar──> POST /trigger-scan
+Brother MFC ──WebDAV──> <scan path>/        ──trigger──> POST /trigger-scan
+mail flow   ──PUT────>  <scan path>/mail/   ──trigger──> (in-process)
                           ↑                              ↓
                           └────── PROPFIND / GET / DELETE ┘   scan flow → Paperless
 ```
+
+Each source is tagged by where it came from — `scanner` for the root, `mail`
+for `mail/` — and the file gauges (`scan_pipeline_files_{ingested,failed,pending}`,
+`scan_pipeline_oldest_pending_file_age_seconds`) carry a matching `source`
+label, one series per source on every push, so a drained source reads 0 rather
+than going stale. `scan_pipeline_last_success_timestamp`,
+`scan_pipeline_run_duration_seconds` and `scan_pipeline_prefect_failures_24h`
+stay per-run and unlabelled.
 
 The safety property worth stating explicitly: `POST /api/documents/post_document/`
 returns 2xx when the document is **queued**, not when it is ingested. Deleting on
@@ -130,11 +153,9 @@ a not-yet-created scan directory treated as an empty one. The tests still run
 every case against two differently-shaped multistatus responses.
 
 Only `.pdf/.jpg/.jpeg/.png/.tif/.tiff` are eligible; dotfiles, other extensions and
-subdirectories are left alone and excluded from the pending-file metric, so an
-unrelated file in the share can never hold the staleness alert open forever.
-
-Scan ingestion is opt-in on `WEBDAV_URL`: with it unset the `scan` deployment is
-not registered and the image behaves exactly as before.
+subdirectories other than `mail/` are left alone and excluded from the
+pending-file metric, so an unrelated file in the share can never hold the
+staleness alert open forever.
 
 ## Document enrichment
 
@@ -227,7 +248,7 @@ already exist — so those names have to be created before matching can ever fir
 
 Paperless exposes no metrics, but its `/api/tasks/` is the source of truth for
 the two faults that stayed invisible in homelab#1589 — a consume that failed
-(silently, on the mail path, which only POSTs) and a starved celery worker
+(silently, on the pre-#1590 mail path, which only POSTed) and a starved celery worker
 leaving tasks queued for hours. Every five minutes the flow reads it with the
 admin token (the one with `view_paperlesstask`) and pushes, under the
 `paperless-health` job:
@@ -253,10 +274,10 @@ the second) rather than a walk over the task list.
 | `PUSHGATEWAY_URL` | no | unset → metrics skipped | Pushgateway URL |
 | `NOTMUCH_CONFIG` | no | `/config/notmuch-config` | Path to notmuch config |
 | `MBSYNC_CONFIG` | no | `/config/mbsyncrc` | Path to mbsync config |
-| `WEBDAV_URL` | no | unset → `scan` flow disabled | WebDAV base URL holding the scans |
-| `WEBDAV_USERNAME` | with `WEBDAV_URL` | — | WebDAV Basic-auth user |
-| `WEBDAV_PASSWORD` | with `WEBDAV_URL` | — | WebDAV Basic-auth password |
-| `WEBDAV_SCAN_PATH` | no | `/` | Path under `WEBDAV_URL` to drain |
+| `WEBDAV_URL` | yes | — | WebDAV base URL holding the scan queue (both flows use it) |
+| `WEBDAV_USERNAME` | yes | — | WebDAV Basic-auth user |
+| `WEBDAV_PASSWORD` | yes | — | WebDAV Basic-auth password |
+| `WEBDAV_SCAN_PATH` | no | `/` | Path under `WEBDAV_URL` to drain; the mail flow queues into `mail/` beneath it |
 | `SCAN_CRON` | no | `0 * * * *` | Sweep schedule for the `scan` deployment |
 | `PAPERLESS_ADMIN_TOKEN` | no | falls back to `PAPERLESS_API_TOKEN` | Superuser Paperless token used by `enrich` |
 | `ENRICH_SWEEP_CRON` | no | unset → sweep has no schedule | Cron for the `enrich-sweep` deployment |

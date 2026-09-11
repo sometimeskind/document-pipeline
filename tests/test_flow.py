@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from email.message import EmailMessage
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -22,55 +22,125 @@ def _message(subject: str = "Test") -> EmailMessage:
     return msg
 
 
-def test_mail_flow_processes_messages_and_pushes_metrics(monkeypatch):
-    from document_pipeline.flow import mail_flow
+def _mail_env(monkeypatch):
     monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
     monkeypatch.setenv("PAPERLESS_API_TOKEN", "tok")
     monkeypatch.setenv("IMAP_PASSWORD", "secret")
+    monkeypatch.setenv("WEBDAV_URL", "http://stalwart:8080/dav")
+    monkeypatch.setenv("WEBDAV_USERNAME", "scanner")
+    monkeypatch.setenv("WEBDAV_PASSWORD", "hunter2")
+    monkeypatch.setenv("WEBDAV_SCAN_PATH", "/file/scanner@prins.id")
 
-    mock_conn = MagicMock()
+
+class _MailRun:
+    """Every collaborator of the mail flow patched, for one run."""
+
+    def __enter__(self):
+        self._patches = [
+            patch("document_pipeline.flow.imap_client"),
+            patch("document_pipeline.flow.extract"),
+            patch("document_pipeline.flow.webdav"),
+            patch("document_pipeline.flow.prefect_client"),
+            patch("document_pipeline.flow.metrics"),
+            patch("document_pipeline.flow.concurrency"),
+        ]
+        self.imap, self.extract, self.webdav, self.prefect, self.metrics, self.concurrency = (
+            p.__enter__() for p in self._patches
+        )
+        self.concurrency.return_value.__enter__.return_value = None
+        self.concurrency.return_value.__exit__.return_value = False
+        self.conn = MagicMock()
+        self.imap.open_inbox.return_value.__enter__.return_value = self.conn
+        self.imap.open_inbox.return_value.__exit__.return_value = False
+        self.queue = self.webdav.WebDAVClient.return_value
+        self.prefect.has_active_scan_run.return_value = False
+        self.prefect.trigger_scan.return_value = True
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.__exit__(*exc)
+        return False
+
+
+def test_mail_flow_queues_pdfs_flags_the_message_and_triggers_a_scan_run(monkeypatch):
+    from document_pipeline.flow import mail_flow
+    _mail_env(monkeypatch)
     msg = _message()
 
-    with patch("document_pipeline.flow.imap_client") as mock_imap, \
-         patch("document_pipeline.flow.extract") as mock_extract, \
-         patch("document_pipeline.flow.metrics") as mock_metrics, \
-         patch("document_pipeline.flow.concurrency") as mock_concurrency:
-        mock_concurrency.return_value.__enter__.return_value = None
-        mock_concurrency.return_value.__exit__.return_value = False
-        mock_imap.open_inbox.return_value.__enter__.return_value = mock_conn
-        mock_imap.open_inbox.return_value.__exit__.return_value = False
-        mock_imap.fetch_unprocessed.return_value = [(b"1", msg)]
-        mock_extract.submit_message_pdfs.return_value = True
+    with _MailRun() as run:
+        run.imap.fetch_unprocessed.return_value = [(b"1", msg)]
+        run.extract.queue_message_pdfs.return_value = 1
 
         mail_flow()
 
-    mock_extract.submit_message_pdfs.assert_called_once()
-    mock_imap.mark_processed.assert_called_once_with(mock_conn, b"1")
-    mock_metrics.push_run_metrics.assert_called_once()
+        run.queue.mkcol.assert_called_once_with("/file/scanner@prins.id/mail")
+        run.extract.queue_message_pdfs.assert_called_once_with(msg, "1", run.queue, "/file/scanner@prins.id/mail")
+        run.imap.mark_processed.assert_called_once_with(run.conn, b"1")
+        # The hop into Paperless is the scan flow's — kicked in-process, as /trigger-scan does.
+        run.prefect.trigger_scan.assert_called_once()
+        run.metrics.push_run_metrics.assert_called_once_with(1, 1, ANY)
 
 
-def test_mail_flow_marks_message_processed_even_without_pdf(monkeypatch):
+def test_mail_flow_does_not_trigger_a_scan_run_when_nothing_was_queued(monkeypatch):
     from document_pipeline.flow import mail_flow
-    monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
-    monkeypatch.setenv("PAPERLESS_API_TOKEN", "tok")
-    monkeypatch.setenv("IMAP_PASSWORD", "secret")
+    _mail_env(monkeypatch)
 
-    mock_conn = MagicMock()
-
-    with patch("document_pipeline.flow.imap_client") as mock_imap, \
-         patch("document_pipeline.flow.extract") as mock_extract, \
-         patch("document_pipeline.flow.metrics"), \
-         patch("document_pipeline.flow.concurrency") as mock_concurrency:
-        mock_concurrency.return_value.__enter__.return_value = None
-        mock_concurrency.return_value.__exit__.return_value = False
-        mock_imap.open_inbox.return_value.__enter__.return_value = mock_conn
-        mock_imap.open_inbox.return_value.__exit__.return_value = False
-        mock_imap.fetch_unprocessed.return_value = [(b"5", _message())]
-        mock_extract.submit_message_pdfs.return_value = False  # no PDF
+    with _MailRun() as run:
+        run.imap.fetch_unprocessed.return_value = [(b"5", _message())]
+        run.extract.queue_message_pdfs.return_value = 0  # no PDF
 
         mail_flow()
 
-    mock_imap.mark_processed.assert_called_once_with(mock_conn, b"5")
+        run.imap.mark_processed.assert_called_once_with(run.conn, b"5")
+        run.prefect.trigger_scan.assert_not_called()
+
+
+def test_mail_flow_coalesces_onto_an_in_flight_scan_run(monkeypatch):
+    from document_pipeline.flow import mail_flow
+    _mail_env(monkeypatch)
+
+    with _MailRun() as run:
+        run.imap.fetch_unprocessed.return_value = [(b"1", _message())]
+        run.extract.queue_message_pdfs.return_value = 1
+        run.prefect.has_active_scan_run.return_value = True
+
+        mail_flow()
+
+        run.prefect.trigger_scan.assert_not_called()
+
+
+def test_mail_flow_leaves_a_message_unflagged_when_its_put_fails_and_fails_the_run(monkeypatch):
+    """A failed PUT must be retried next run — flagging would lose the PDF; a
+    Completed run would hide that it happened. Other messages still go through."""
+    from document_pipeline.flow import mail_flow
+    _mail_env(monkeypatch)
+
+    with _MailRun() as run:
+        run.imap.fetch_unprocessed.return_value = [(b"1", _message()), (b"2", _message())]
+        run.extract.queue_message_pdfs.side_effect = [ConnectionError("stalwart down"), 1]
+
+        with pytest.raises(RuntimeError, match="unflagged"):
+            mail_flow()
+
+        run.imap.mark_processed.assert_called_once_with(run.conn, b"2")
+        run.prefect.trigger_scan.assert_called_once()
+        run.metrics.push_run_metrics.assert_not_called()
+
+
+def test_mail_flow_flags_nothing_when_the_queue_directory_cannot_be_created(monkeypatch):
+    from document_pipeline.flow import mail_flow
+    _mail_env(monkeypatch)
+
+    with _MailRun() as run:
+        run.imap.fetch_unprocessed.return_value = [(b"1", _message())]
+        run.queue.mkcol.side_effect = ConnectionError("stalwart down")
+
+        with pytest.raises(ConnectionError):
+            mail_flow()
+
+        run.extract.queue_message_pdfs.assert_not_called()
+        run.imap.mark_processed.assert_not_called()
 
 
 def test_mail_flow_propagates_imap_timeout():
@@ -101,7 +171,7 @@ def test_mail_flow_skipped_when_pipeline_busy():
         mail_flow()
 
         mock_imap.fetch_unprocessed.assert_not_called()
-        mock_extract.submit_message_pdfs.assert_not_called()
+        mock_extract.queue_message_pdfs.assert_not_called()
         mock_metrics.push_run_metrics.assert_not_called()
 
 

@@ -233,3 +233,51 @@ def test_requests_carry_basic_auth(client):
     client.list("homes/scanner")
 
     assert route.calls.last.request.headers["Authorization"].startswith("Basic ")
+
+
+# --- the mail queue's writes (homelab#1590) ---
+
+@respx.mock
+def test_put_writes_the_payload_and_overwrites(client):
+    route = respx.put(f"{BASE_URL}/homes/scanner/mail/42-invoice.pdf").mock(return_value=httpx.Response(204))
+
+    client.put("homes/scanner/mail/42-invoice.pdf", b"%PDF-1.4")
+
+    request = route.calls.last.request
+    assert request.read() == b"%PDF-1.4"
+    assert request.headers["Content-Length"] == "8"
+    # No existence PROPFIND first: a retried message must replace its own object.
+    assert all(c.request.method == "PUT" for c in respx.calls)
+
+
+@respx.mock
+def test_put_raises_on_failure(client):
+    respx.put(f"{BASE_URL}/homes/scanner/mail/42-invoice.pdf").mock(return_value=httpx.Response(507))
+
+    with pytest.raises(Exception):
+        client.put("homes/scanner/mail/42-invoice.pdf", b"%PDF-1.4")
+
+
+@respx.mock
+def test_mkcol_creates_the_collection(client):
+    route = respx.request("MKCOL", f"{BASE_URL}/homes/scanner/mail/").mock(return_value=httpx.Response(201))
+
+    client.mkcol("homes/scanner/mail")
+
+    assert route.called
+
+
+@respx.mock
+def test_mkcol_treats_an_existing_collection_as_success(client):
+    """RFC 4918: MKCOL on an existing resource is 405. Every mail run issues one."""
+    respx.request("MKCOL", f"{BASE_URL}/homes/scanner/mail/").mock(return_value=httpx.Response(405))
+
+    client.mkcol("homes/scanner/mail")
+
+
+@respx.mock
+def test_mkcol_raises_when_the_parent_is_missing(client):
+    respx.request("MKCOL", f"{BASE_URL}/homes/scanner/mail/").mock(return_value=httpx.Response(409))
+
+    with pytest.raises(Exception):
+        client.mkcol("homes/scanner/mail")

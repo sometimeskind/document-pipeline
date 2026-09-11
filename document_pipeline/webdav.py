@@ -1,4 +1,4 @@
-"""WebDAV access for the scan pipeline, on top of `webdav4`.
+"""WebDAV access for the scan queue, on top of `webdav4`.
 
 `webdav4` rather than a hand-rolled client: it speaks RFC 4918 over httpx —
 already a dependency here, so no second HTTP stack — it is maintained, and its
@@ -8,7 +8,7 @@ last point is the one the pipeline actually needs: a later move off Davis
 client tested against a different server than ours is far better evidence of
 that than fixtures we wrote ourselves.
 
-This module is only the adapter. It exists for the three things `webdav4`
+This module is only the adapter. It exists for the things `webdav4`
 correctly leaves to the caller:
 
   * entries in the shape the scan flow wants;
@@ -16,7 +16,9 @@ correctly leaves to the caller:
     overlapping runs racing on the same file is expected and benign;
   * a missing scan directory treated as an empty one — sabre creates a user's
     home lazily on first authenticated access, so it genuinely does not exist
-    until the scanner (or an operator) first writes to it.
+    until the scanner (or an operator) first writes to it;
+  * "already exists" treated as success for a collection, so the mail flow can
+    ensure its `mail/` queue directory on every run without a PROPFIND first.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from webdav4.client import Client, ResourceNotFound
+from webdav4.client import Client, HTTPError, ResourceAlreadyExists, ResourceNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -120,3 +122,25 @@ class WebDAVClient:
             self._client.remove(path)
         except ResourceNotFound:
             logger.info("%r was already gone", path)
+
+    def put(self, path: str, payload: bytes) -> None:
+        """Write `payload` at `path`, replacing whatever is there.
+
+        Overwrite is the point: the mail flow names objects by IMAP UID, so a
+        retry after a failed run must land on the same object, not beside it.
+        """
+        self._client.upload_fileobj(io.BytesIO(payload), path, overwrite=True, size=len(payload))
+
+    def mkcol(self, path: str) -> None:
+        """Create a collection. Already-present counts as success — presence is the goal."""
+        try:
+            self._client.mkdir(path)
+        except ResourceAlreadyExists:
+            # webdav4's reading of the 405 an existing collection answers with.
+            return
+        except HTTPError as exc:
+            # Some servers answer MKCOL on an existing collection with a redirect
+            # to its slash-terminated form instead of a 405.
+            if exc.status_code == 301:
+                return
+            raise

@@ -1,14 +1,17 @@
-"""Tests for document_pipeline.extract — PDF extraction and Paperless submission."""
+"""Tests for document_pipeline.extract — PDF extraction into the WebDAV scan queue."""
 
 from __future__ import annotations
 
 import email
 from email.message import EmailMessage, Message
+from unittest.mock import MagicMock
 
 import httpx
+import pytest
 import respx
 
 from document_pipeline import extract
+from document_pipeline.webdav import WebDAVClient
 
 
 def _pdf_message() -> EmailMessage:
@@ -25,32 +28,49 @@ def _pdf_message() -> EmailMessage:
     return msg
 
 
-@respx.mock
-def test_submit_message_pdfs_submits_pdf_and_returns_true():
-    route = respx.post("http://paperless/api/documents/post_document/").mock(
-        return_value=httpx.Response(200)
-    )
-    result = extract.submit_message_pdfs(_pdf_message(), "http://paperless", "tok")
-    assert result is True
-    assert route.called
-    body = route.calls[0].request.content
-    assert b"invoice.pdf" in body
-    assert b"%PDF-1.4 sample" in body
+@pytest.fixture
+def queue():
+    return MagicMock(spec=WebDAVClient)
 
 
-def test_submit_message_pdfs_returns_false_when_no_pdf():
+def test_queue_message_pdfs_puts_each_pdf_under_the_uid(queue):
+    count = extract.queue_message_pdfs(_pdf_message(), "42", queue, "/homes/scanner/mail")
+
+    assert count == 1
+    queue.put.assert_called_once_with("/homes/scanner/mail/42-invoice.pdf", b"%PDF-1.4 sample")
+
+
+def test_queue_message_pdfs_returns_zero_when_no_pdf(queue):
     msg = EmailMessage()
     msg.set_content("just text, no attachments")
-    assert extract.submit_message_pdfs(msg, "http://paperless", "tok") is False
+
+    assert extract.queue_message_pdfs(msg, "42", queue, "/homes/scanner/mail") == 0
+    queue.put.assert_not_called()
 
 
-@respx.mock
-def test_submit_message_pdfs_sends_auth_token():
-    route = respx.post("http://paperless/api/documents/post_document/").mock(
-        return_value=httpx.Response(200)
-    )
-    extract.submit_message_pdfs(_pdf_message(), "http://paperless", "mytoken")
-    assert route.calls[0].request.headers["authorization"] == "Token mytoken"
+def test_queue_message_pdfs_propagates_a_failed_put(queue):
+    """The caller decides what an unqueued message means (it stays unflagged);
+    swallowing the error here would flag a message whose PDF never landed."""
+    queue.put.side_effect = httpx.ConnectError("stalwart down")
+
+    with pytest.raises(httpx.ConnectError):
+        extract.queue_message_pdfs(_pdf_message(), "42", queue, "/homes/scanner/mail")
+
+
+def test_queue_message_pdfs_keeps_two_same_named_attachments_apart(queue):
+    msg = _pdf_message()
+    msg.add_attachment(b"%PDF-1.4 second", maintype="application", subtype="pdf", filename="invoice.pdf")
+
+    assert extract.queue_message_pdfs(msg, "42", queue, "/homes/scanner/mail") == 2
+    assert [c.args[0] for c in queue.put.call_args_list] == [
+        "/homes/scanner/mail/42-invoice.pdf", "/homes/scanner/mail/42-invoice-2.pdf"
+    ]
+
+
+def test_queue_message_pdfs_never_posts_to_paperless(queue):
+    with respx.mock(assert_all_mocked=True) as router:
+        extract.queue_message_pdfs(_pdf_message(), "42", queue, "/homes/scanner/mail")
+        assert not router.calls
 
 
 def _raw_pdf_part(disposition_params: str) -> Message:
@@ -130,22 +150,18 @@ def test_attachment_filename_appends_pdf_when_missing():
     assert extract._attachment_filename(part) == "Leistungsübersicht.pdf"
 
 
-@respx.mock
-def test_submit_message_pdfs_sends_decoded_filename():
-    route = respx.post("http://paperless/api/documents/post_document/").mock(
-        return_value=httpx.Response(200)
-    )
+def test_queue_message_pdfs_uses_the_decoded_filename_with_a_pdf_suffix(queue):
     msg = email.message_from_string(
         "Content-Type: multipart/mixed; boundary=b\n"
         "\n"
         "--b\n"
         "Content-Type: application/pdf\n"
-        'Content-Disposition: attachment; filename="=?utf-8?q?vorl=C3=A4ufig.pdf?="\n'
+        'Content-Disposition: attachment; filename="=?utf-8?q?vorl=C3=A4ufig?="\n'
         "Content-Transfer-Encoding: base64\n"
         "\n"
         "JVBERi0xLjQgc2FtcGxl\n"
         "--b--\n"
     )
-    assert extract.submit_message_pdfs(msg, "http://paperless", "tok") is True
-    # httpx writes the filename as raw UTF-8 bytes into the multipart header.
-    assert 'filename="vorläufig.pdf"'.encode() in route.calls[0].request.content
+    assert extract.queue_message_pdfs(msg, "7", queue, "/q") == 1
+    # `.pdf` is what keeps the object inside the scan flow's eligibility allowlist.
+    queue.put.assert_called_once_with("/q/7-vorläufig.pdf", b"%PDF-1.4 sample")

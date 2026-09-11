@@ -15,12 +15,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-_REQUIRED = ("PREFECT_API_URL", "PAPERLESS_URL", "PAPERLESS_API_TOKEN", "API_BEARER_TOKEN", "IMAP_PASSWORD")
-# Scan ingestion is opt-in on WEBDAV_URL. The deployment pins `:latest` by
-# digest and Renovate bumps that digest automatically, so a new image can land
-# before the manifest that configures it — making scan config mandatory would
-# turn that ordering into a mail-ingestion outage.
-_REQUIRED_SCAN = ("WEBDAV_USERNAME", "WEBDAV_PASSWORD")
+# WebDAV is no longer opt-in: the mail flow queues its PDFs through it
+# (homelab#1590), so without it neither ingest path works.
+_REQUIRED = (
+    "PREFECT_API_URL", "PAPERLESS_URL", "PAPERLESS_API_TOKEN", "API_BEARER_TOKEN", "IMAP_PASSWORD",
+    "WEBDAV_URL", "WEBDAV_USERNAME", "WEBDAV_PASSWORD",
+)
 
 # Hourly sweep. inotify only reports live events, so this is what picks up
 # anything that arrived while the watcher sidecar was down, and bounds that
@@ -63,8 +63,6 @@ def main() -> None:
         return
 
     missing = [v for v in _REQUIRED if not os.environ.get(v)]
-    if os.environ.get("WEBDAV_URL"):
-        missing += [v for v in _REQUIRED_SCAN if not os.environ.get(v)]
     if missing:
         for var in missing:
             logger.error("Required environment variable not set: %s", var)
@@ -85,7 +83,6 @@ def main() -> None:
     from document_pipeline.prefect_client import ensure_concurrency_limits
 
     fetch_cron = os.environ.get("FETCH_CRON")
-    scan_enabled = bool(os.environ.get("WEBDAV_URL"))
 
     # Start Flask first so /health responds immediately, even while Prefect
     # init below is still retrying against a slow or starting server.
@@ -105,8 +102,7 @@ def main() -> None:
 
     deployments = [mail_flow.to_deployment(name="mail", cron=fetch_cron)]
     scan_cron = os.environ.get("SCAN_CRON", _DEFAULT_SCAN_CRON)
-    if scan_enabled:
-        deployments.append(scan_flow.to_deployment(name="scan", cron=scan_cron))
+    deployments.append(scan_flow.to_deployment(name="scan", cron=scan_cron))
 
     # Trigger-driven, so no cron. `concurrency_limit` is not the Ollama slot the
     # flow itself takes — it is what keeps queued runs out of the serve() runner.
@@ -141,7 +137,7 @@ def main() -> None:
         "Starting Prefect runner (FETCH_CRON=%s, SCAN_CRON=%s, ENRICH_SWEEP_CRON=%s, "
         "CORRESPONDENT_BACKFILL_CRON=%s, PAPERLESS_HEALTH_CRON=%s)",
         fetch_cron or "disabled",
-        scan_cron if scan_enabled else "disabled",
+        scan_cron,
         enrich_sweep_cron or "disabled",
         (backfill_cron or "unscheduled") if backfill_enabled else "disabled",
         paperless_health_cron,
