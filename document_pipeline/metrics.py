@@ -9,6 +9,8 @@ import time
 import httpx
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway, pushadd_to_gateway
 
+from document_pipeline.scan import SourceResult
+
 logger = logging.getLogger(__name__)
 
 _PREFECT_FILTER_URL = "{url}/flow_runs/filter"
@@ -67,7 +69,10 @@ def push_run_metrics(
     ).set(emails_synced)
     Gauge(
         "document_pipeline_pdfs_submitted",
-        "Number of PDFs submitted to Paperless in the last run",
+        # Handed to the WebDAV scan queue, not to Paperless: since homelab#1590
+        # the scan flow does the submit, and its scan_pipeline_* series
+        # (source="mail") say whether they landed.
+        "Number of PDF attachments handed to the WebDAV scan queue in the last run",
         registry=registry,
     ).set(pdfs_submitted)
     Gauge(
@@ -89,18 +94,16 @@ def push_run_metrics(
     _push(url, "mail-pipeline", registry)
 
 
-def push_scan_metrics(
-    files_ingested: int,
-    files_failed: int,
-    files_pending: int,
-    oldest_pending_age_seconds: float,
-    duration_seconds: float,
-) -> None:
+def push_scan_metrics(sources: dict[str, SourceResult], duration_seconds: float) -> None:
     """Push per-run scan metrics to Pushgateway. No-op when PUSHGATEWAY_URL is unset.
 
     Pushed under its own job name: a push replaces every metric in a job's
     group, so sharing `mail-pipeline` would have each flow wipe the other's
     gauges on every run.
+
+    The per-file gauges carry a `source` label (`scanner`, `mail`), one series
+    per source on every push — a drained source reads 0 rather than vanishing,
+    so the alerts on them resolve instead of going stale.
     """
     url = os.environ.get("PUSHGATEWAY_URL", "")
     if not url:
@@ -113,28 +116,37 @@ def push_scan_metrics(
         "Unix timestamp of the last successful scan-pipeline run",
         registry=registry,
     ).set(time.time())
-    Gauge(
+    ingested = Gauge(
         "scan_pipeline_files_ingested",
-        "Number of scans accepted by Paperless and removed from WebDAV in the last run",
+        "Number of files accepted by Paperless and removed from WebDAV in the last run",
+        ["source"],
         registry=registry,
-    ).set(files_ingested)
-    Gauge(
+    )
+    failed = Gauge(
         "scan_pipeline_files_failed",
-        "Number of scans that failed to ingest in the last run",
+        "Number of files that failed to ingest in the last run",
+        ["source"],
         registry=registry,
-    ).set(files_failed)
-    Gauge(
+    )
+    pending = Gauge(
         "scan_pipeline_files_pending",
-        "Number of eligible scans still sitting in WebDAV after the last run",
+        "Number of eligible files still sitting in WebDAV after the last run",
+        ["source"],
         registry=registry,
-    ).set(files_pending)
+    )
     # An age rather than a timestamp so an empty directory pushes 0 and the
     # staleness alert resolves itself.
-    Gauge(
+    oldest = Gauge(
         "scan_pipeline_oldest_pending_file_age_seconds",
-        "Age of the oldest eligible scan still in WebDAV, 0 when none remain",
+        "Age of the oldest eligible file still in WebDAV, 0 when none remain",
+        ["source"],
         registry=registry,
-    ).set(oldest_pending_age_seconds)
+    )
+    for source, result in sources.items():
+        ingested.labels(source=source).set(result.ingested)
+        failed.labels(source=source).set(result.failed)
+        pending.labels(source=source).set(result.pending)
+        oldest.labels(source=source).set(result.oldest_pending_age_seconds)
     Gauge(
         "scan_pipeline_run_duration_seconds",
         "Total duration of the last successful scan-pipeline run in seconds",

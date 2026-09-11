@@ -1,10 +1,12 @@
-"""Ingest scanned documents from a WebDAV share into Paperless.
+"""Ingest queued documents from a WebDAV share into Paperless.
 
-The scanner (a Brother MFC) writes straight to a WebDAV home over the LAN; this
-module drains that directory. The contract that makes it safe to delete the
-only copy of a document: a 2xx from `post_document` means *queued*, not
-*ingested*, so every file is followed through to a terminal Paperless task
-state and only removed once that state says the document actually landed.
+Two producers write into the same share: the scanner (a Brother MFC, via the
+FTP bridge) into the root, and the mail flow into `mail/` — see
+`extract.queue_message_pdfs`. This module drains both. The contract that makes
+it safe to delete the only copy of a document: a 2xx from `post_document` means
+*queued*, not *ingested*, so every file is followed through to a terminal
+Paperless task state and only removed once that state says the document
+actually landed.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import datetime
 import logging
 import mimetypes
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -26,6 +28,12 @@ logger = logging.getLogger(__name__)
 # share can never hold the staleness alert on forever.
 SCAN_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff")
 
+# Source name → subdirectory under the scan path. The name doubles as the
+# Paperless tag applied at ingest and as the `source` label on the metrics.
+# `scanner` is the root the FTP bridge writes to; `mail` is where the mail flow
+# queues PDF attachments (homelab#1590).
+SOURCES: dict[str, str] = {"scanner": "", "mail": "mail"}
+
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_POLL_TIMEOUT_SECONDS = 300.0
 
@@ -34,14 +42,47 @@ _TERMINAL_STATUSES = frozenset({"success", "failure", "revoked"})
 
 
 @dataclass
-class ScanResult:
-    """Outcome of one drain of the scan directory."""
+class SourceResult:
+    """Outcome of one drain of one source directory."""
 
     ingested: int = 0
     failed: int = 0
     ignored: int = 0
     pending: int = 0
     oldest_pending_age_seconds: float = 0.0
+
+
+@dataclass
+class ScanResult:
+    """Outcome of one drain of every source, keyed by source name."""
+
+    sources: dict[str, SourceResult] = field(default_factory=dict)
+
+    @property
+    def ingested(self) -> int:
+        return sum(s.ingested for s in self.sources.values())
+
+    @property
+    def failed(self) -> int:
+        return sum(s.failed for s in self.sources.values())
+
+    @property
+    def ignored(self) -> int:
+        return sum(s.ignored for s in self.sources.values())
+
+    @property
+    def pending(self) -> int:
+        return sum(s.pending for s in self.sources.values())
+
+    @property
+    def oldest_pending_age_seconds(self) -> float:
+        return max((s.oldest_pending_age_seconds for s in self.sources.values()), default=0.0)
+
+
+def source_path(scan_path: str, source: str) -> str:
+    """Directory a source is drained from — what the mail flow writes into too."""
+    subdir = SOURCES[source]
+    return f"{scan_path.rstrip('/')}/{subdir}" if subdir else scan_path
 
 
 def is_eligible(name: str) -> bool:
@@ -58,48 +99,70 @@ def ingest_scans(
     scan_path: str,
     paperless_url: str,
     paperless_token: str,
-    tag: str = "scanner",
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     poll_timeout: float = DEFAULT_POLL_TIMEOUT_SECONDS,
 ) -> ScanResult:
-    """Ingest every eligible scan under `scan_path`, deleting each on success."""
-    entries = webdav.list(scan_path)
+    """Drain every source under `scan_path`, deleting each file on success."""
+    result = ScanResult()
+    with httpx.Client(headers={"Authorization": f"Token {paperless_token}"}, timeout=60.0) as client:
+        for source in SOURCES:
+            result.sources[source] = _drain(
+                webdav, source_path(scan_path, source), source, client, paperless_url, poll_interval, poll_timeout
+            )
+    logger.info(
+        "Scan ingest complete: %d ingested, %d failed, %d ignored", result.ingested, result.failed, result.ignored
+    )
+    return result
+
+
+def _drain(
+    webdav: WebDAVClient,
+    path: str,
+    source: str,
+    client: httpx.Client,
+    paperless_url: str,
+    poll_interval: float,
+    poll_timeout: float,
+) -> SourceResult:
+    """Ingest every eligible file directly under `path`, tagged with the source name."""
+    entries = webdav.list(path)
     files = [e for e in entries if not e.is_collection]
     eligible = [e for e in files if is_eligible(e.name)]
 
     for collection in (e for e in entries if e.is_collection):
+        if collection.name in SOURCES.values():
+            continue
         # Depth-1 only: some printer firmwares create date subfolders. Surface
         # them rather than silently descending into an unknown layout.
-        logger.warning("Ignoring subdirectory %r under %s — scans there are not ingested", collection.name, scan_path)
+        logger.warning("Ignoring subdirectory %r under %s — scans there are not ingested", collection.name, path)
 
-    result = ScanResult(ignored=len(files) - len(eligible))
+    result = SourceResult(ignored=len(files) - len(eligible))
     if result.ignored:
-        logger.info("Ignoring %d non-scan file(s) in %s", result.ignored, scan_path)
+        logger.info("Ignoring %d non-scan file(s) in %s", result.ignored, path)
     if not eligible:
-        logger.info("No eligible scans in %s", scan_path)
+        logger.info("No eligible files in %s", path)
         return result
 
     remaining: list[WebDAVEntry] = []
-    with httpx.Client(headers={"Authorization": f"Token {paperless_token}"}, timeout=60.0) as client:
-        tag_ids = [resolve_tag(client, paperless_url, tag)] if tag else []
-        for entry in eligible:
-            try:
-                if not _ingest_one(entry, webdav, client, paperless_url, tag_ids, poll_interval, poll_timeout):
-                    result.failed += 1
-                    remaining.append(entry)
-                    continue
-                result.ingested += 1
-            except Exception as exc:
-                # Per-file isolation: one malformed scan must never strand the
-                # rest of the batch behind it.
-                logger.error("Failed to ingest %r: %s", entry.name, exc)
+    tag_ids = [resolve_tag(client, paperless_url, source)]
+    for entry in eligible:
+        try:
+            if not _ingest_one(entry, webdav, client, paperless_url, tag_ids, poll_interval, poll_timeout):
                 result.failed += 1
                 remaining.append(entry)
+                continue
+            result.ingested += 1
+        except Exception as exc:
+            # Per-file isolation: one malformed scan must never strand the
+            # rest of the batch behind it.
+            logger.error("Failed to ingest %r: %s", entry.name, exc)
+            result.failed += 1
+            remaining.append(entry)
 
     result.pending = len(remaining)
     result.oldest_pending_age_seconds = _oldest_age_seconds(remaining)
     logger.info(
-        "Scan ingest complete: %d ingested, %d failed, %d ignored", result.ingested, result.failed, result.ignored
+        "%s: %d ingested, %d failed, %d ignored", source, result.ingested, result.failed, result.ignored
     )
     return result
 

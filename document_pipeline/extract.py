@@ -1,15 +1,18 @@
-"""Extract PDF attachments from mail messages and submit them to Paperless."""
+"""Extract PDF attachments from mail messages into the WebDAV scan queue.
+
+The queue is drained by `scan.ingest_scans`, which is what follows each file to
+a terminal Paperless task state — the mail flow itself never talks to Paperless
+(homelab#1590)."""
 
 from __future__ import annotations
 
 import logging
 import re
-import time
 import unicodedata
 from email.header import decode_header, make_header
 from email.message import Message
 
-import httpx
+from document_pipeline.webdav import WebDAVClient
 
 logger = logging.getLogger(__name__)
 
@@ -23,20 +26,16 @@ _MAX_STEM_CHARS = 120
 _RFC2231_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9_.:+-]*''")
 
 
-def submit_message_pdfs(msg: Message, paperless_url: str, paperless_token: str) -> bool:
-    """Submit PDF attachments from msg to Paperless. Returns True if any were submitted."""
-    with httpx.Client(
-        headers={"Authorization": f"Token {paperless_token}"},
-        timeout=30.0,
-    ) as client:
-        count, _ = _submit_pdfs(msg, client, paperless_url)
-    return count > 0
+def queue_message_pdfs(msg: Message, uid: str, queue: WebDAVClient, queue_path: str) -> int:
+    """PUT every PDF attachment of `msg` into the scan queue. Returns how many.
 
-
-def _submit_pdfs(msg: Message, client: httpx.Client, paperless_url: str) -> tuple[int, int]:
-    """Return (number of PDFs submitted, total bytes)."""
+    Objects are named `<uid>-<filename>` so a message retried after a failed
+    PUT overwrites its own earlier objects rather than queueing duplicates.
+    Nothing is caught here on purpose: a failed PUT must propagate so the
+    caller leaves the message unflagged for the next run.
+    """
     count = 0
-    total = 0
+    names: set[str] = set()
     for part in msg.walk():
         if part.get_content_type() != "application/pdf":
             continue
@@ -46,22 +45,24 @@ def _submit_pdfs(msg: Message, client: httpx.Client, paperless_url: str) -> tupl
             logger.warning("  PDF part %r had empty payload, skipping", filename)
             continue
 
-        size = len(payload)
-        logger.info("  -> submitting PDF %r (%s) to Paperless", filename, _human_size(size))
-        started = time.perf_counter()
-        resp = client.post(
-            f"{paperless_url}/api/documents/post_document/",
-            files={"document": (filename, payload, "application/pdf")},
-        )
-        resp.raise_for_status()
-        logger.info(
-            "     paperless accepted %r: HTTP %d in %.2fs",
-            filename, resp.status_code, time.perf_counter() - started,
-        )
+        name = _unique(f"{uid}-{filename}", names)
+        names.add(name)
+        queue.put(f"{queue_path}/{name}", payload)
+        logger.info("  -> queued PDF %r (%d bytes) as %r", filename, len(payload), name)
         count += 1
-        total += size
 
-    return count, total
+    return count
+
+
+def _unique(name: str, taken: set[str]) -> str:
+    """Suffix the stem when a message carries two attachments with one name."""
+    if name not in taken:
+        return name
+    stem, _, ext = name.rpartition(".")
+    n = 2
+    while f"{stem}-{n}.{ext}" in taken:
+        n += 1
+    return f"{stem}-{n}.{ext}"
 
 
 def _attachment_filename(part: Message) -> str:
@@ -83,8 +84,8 @@ def _attachment_filename(part: Message) -> str:
 
 
 def _sanitise(name: str) -> str:
-    """Make a decoded filename safe for the multipart filename field."""
-    # Sender-controlled text now heading for a form field and a filesystem.
+    """Make a decoded filename safe as a WebDAV object name and a Paperless filename."""
+    # Sender-controlled text now heading for a URL path and a filesystem.
     name = name.replace("/", "_").replace("\\", "_")
     # Category C* is control/format/surrogate/unassigned — nothing that belongs
     # in a filename, and CR/LF would otherwise ride into a multipart header.
@@ -96,12 +97,3 @@ def _sanitise(name: str) -> str:
     if not dot or ext.lower() != "pdf":
         stem, ext = name, "pdf"
     return f"{stem[:_MAX_STEM_CHARS]}.{ext}"
-
-
-def _human_size(n: int) -> str:
-    size = float(n)
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TiB"
