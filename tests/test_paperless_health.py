@@ -79,6 +79,14 @@ def test_oldest_unfinished_age_comes_from_the_oldest_pending_or_started_task():
 
 
 @respx.mock
+def test_acknowledged_unfinished_tasks_are_ignored():
+    # A task record orphaned in PENDING by a pod killed mid-run is dismissed
+    # in the Paperless UI; the probe must then stop counting its age.
+    _fake_tasks_api([_task("pending", created_ago=9_000_000, acknowledged=True), _task("started", created_ago=300)])
+    assert 299 <= paperless_health.probe(PAPERLESS, "tok").oldest_unfinished_seconds <= 301
+
+
+@respx.mock
 def test_finished_tasks_are_ignored():
     _fake_tasks_api([_task("success", created_ago=3000), _task("revoked", created_ago=3000)])
     assert paperless_health.probe(PAPERLESS, "tok") == paperless_health.TaskQueueHealth(0, 0.0)
