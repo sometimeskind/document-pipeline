@@ -124,40 +124,64 @@ def _drain(
     poll_interval: float,
     poll_timeout: float,
 ) -> SourceResult:
-    """Ingest every eligible file directly under `path`, tagged with the source name."""
-    entries = webdav.list(path)
-    files = [e for e in entries if not e.is_collection]
-    eligible = [e for e in files if is_eligible(e.name)]
+    """Ingest every eligible file directly under `path`, tagged with the source name.
 
-    for collection in (e for e in entries if e.is_collection):
-        if collection.name in SOURCES.values():
-            continue
-        # Depth-1 only: some printer firmwares create date subfolders. Surface
-        # them rather than silently descending into an unknown layout.
-        logger.warning("Ignoring subdirectory %r under %s — scans there are not ingested", collection.name, path)
-
-    result = SourceResult(ignored=len(files) - len(eligible))
-    if result.ignored:
-        logger.info("Ignoring %d non-scan file(s) in %s", result.ignored, path)
-    if not eligible:
-        logger.info("No eligible files in %s", path)
-        return result
-
+    Lists again after every pass and stops only when a listing shows nothing
+    new. `/trigger-scan` answers 202 to an upload that lands while a run is in
+    flight, promising that this run will pick it up — a single listing taken
+    before a 90 s Paperless consume cannot keep that promise (#56). A file is
+    tried at most once per run, so a failing consume ends the loop instead of
+    spinning it.
+    """
+    result = SourceResult()
+    tried: set[str] = set()
     remaining: list[WebDAVEntry] = []
-    tag_ids = [resolve_tag(client, paperless_url, source)]
-    for entry in eligible:
-        try:
-            if not _ingest_one(entry, webdav, client, paperless_url, tag_ids, poll_interval, poll_timeout):
+    tag_ids: list[int] | None = None
+    first_pass = True
+
+    while True:
+        entries = webdav.list(path)
+        files = [e for e in entries if not e.is_collection]
+        eligible = [e for e in files if is_eligible(e.name)]
+        new = [e for e in eligible if e.name not in tried]
+        result.ignored = len(files) - len(eligible)
+
+        if first_pass:
+            for collection in (e for e in entries if e.is_collection):
+                if collection.name in SOURCES.values():
+                    continue
+                # Depth-1 only: some printer firmwares create date subfolders. Surface
+                # them rather than silently descending into an unknown layout.
+                logger.warning(
+                    "Ignoring subdirectory %r under %s — scans there are not ingested", collection.name, path
+                )
+            if result.ignored:
+                logger.info("Ignoring %d non-scan file(s) in %s", result.ignored, path)
+            if not new:
+                logger.info("No eligible files in %s", path)
+                return result
+            first_pass = False
+        elif not new:
+            break
+        else:
+            logger.info("%d file(s) landed in %s during this run, draining them too", len(new), path)
+
+        if tag_ids is None:
+            tag_ids = [resolve_tag(client, paperless_url, source)]
+        for entry in new:
+            tried.add(entry.name)
+            try:
+                if not _ingest_one(entry, webdav, client, paperless_url, tag_ids, poll_interval, poll_timeout):
+                    result.failed += 1
+                    remaining.append(entry)
+                    continue
+                result.ingested += 1
+            except Exception as exc:
+                # Per-file isolation: one malformed scan must never strand the
+                # rest of the batch behind it.
+                logger.error("Failed to ingest %r: %s", entry.name, exc)
                 result.failed += 1
                 remaining.append(entry)
-                continue
-            result.ingested += 1
-        except Exception as exc:
-            # Per-file isolation: one malformed scan must never strand the
-            # rest of the batch behind it.
-            logger.error("Failed to ingest %r: %s", entry.name, exc)
-            result.failed += 1
-            remaining.append(entry)
 
     result.pending = len(remaining)
     result.oldest_pending_age_seconds = _oldest_age_seconds(remaining)

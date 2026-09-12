@@ -34,9 +34,10 @@ def create_app() -> Flask:
     @app.post("/trigger-scan")
     def trigger_scan():
         # 202 means "a run is already in flight and will pick this up" — the
-        # scan directory is drained wholesale, so an in-flight run covers files
-        # that landed after it started. Callers fire one trigger per inotify
-        # event; coalescing here is what stops a 20-page batch queueing 20 runs.
+        # scan flow re-lists each source until a listing shows nothing new, so
+        # an in-flight run covers files that landed after it started (#56).
+        # Callers fire one trigger per inotify event; coalescing here is what
+        # stops a 20-page batch queueing 20 runs.
         from document_pipeline import prefect_client
         if prefect_client.has_active_scan_run():
             return jsonify({}), 202
