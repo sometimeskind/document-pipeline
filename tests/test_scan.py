@@ -278,3 +278,31 @@ def test_source_path_places_the_mail_queue_under_the_scan_path():
     assert scan.source_path("/file/scanner@prins.id", "mail") == "/file/scanner@prins.id/mail"
     assert scan.source_path("/file/scanner@prins.id/", "mail") == "/file/scanner@prins.id/mail"
     assert scan.source_path("/file/scanner@prins.id", "scanner") == "/file/scanner@prins.id"
+
+
+@respx.mock
+def test_a_file_that_lands_mid_run_is_ingested_by_the_same_run(webdav):
+    """`/trigger-scan` answers 202 while a run is in flight on the promise that
+    the run picks the upload up; a run that listed once could not keep it (#56)."""
+    first, second = _entry("scan001.pdf"), _entry("scan002.pdf")
+    root_listings = iter([[first], [second], []])
+    webdav.list.side_effect = lambda path: next(root_listings) if path == SCAN_PATH else []
+    post = _mock_paperless()
+
+    result = _ingest(webdav)
+
+    assert (result.ingested, result.failed, result.pending) == (2, 0, 0)
+    assert post.call_count == 2
+    assert webdav.list.call_count == 4  # three root listings, one for mail/
+
+
+@respx.mock
+def test_a_failing_file_is_tried_once_and_does_not_loop_the_run(webdav):
+    _listing(webdav, [_entry("scan001.pdf")])
+    post = _mock_paperless(task_status="failure")
+
+    result = _ingest(webdav)
+
+    assert (result.ingested, result.failed, result.pending) == (0, 1, 1)
+    assert post.call_count == 1
+    assert webdav.list.call_count == 3  # root, root again (nothing new), mail/

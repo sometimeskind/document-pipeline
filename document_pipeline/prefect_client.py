@@ -81,7 +81,9 @@ def has_active_scan_run() -> bool:
     This is what coalesces a burst of triggers: a multi-page batch fires one
     inotify event per file, and every trigger after the first is answered 202
     instead of queueing another Prefect run that would only block on the
-    concurrency slot. Mirrors mail-sync's `/trigger-flow` path.
+    concurrency slot. Mirrors mail-sync's `/trigger-flow` path. Safe only
+    because the scan flow re-lists until nothing new appears (`scan._drain`,
+    #56) — a run that listed once would miss the upload behind the 202.
     """
     return _has_active_run("scan")
 
