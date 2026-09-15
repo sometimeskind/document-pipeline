@@ -24,6 +24,12 @@ _MAX_STEM_CHARS = 120
 # "utf-8''Leistungsübersicht.pdf"). Observed on 4 of the 47 documents this bug
 # produced.
 _RFC2231_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9_.:+-]*''")
+# Characters a sender-supplied name must not carry into the queue URL. `/` and
+# `\` are separators. `?` and `#` terminate the path component, so httpx refuses
+# to parse the URL at all and the PUT never leaves the pod (#58). `%` would be
+# read back as the start of an escape sequence, so leaving it in would let a
+# name smuggle an encoded separator past this very substitution.
+_UNSAFE_IN_PATH = re.compile(r"[/\\?#%]")
 
 
 def queue_message_pdfs(msg: Message, uid: str, queue: WebDAVClient, queue_path: str) -> int:
@@ -86,7 +92,7 @@ def _attachment_filename(part: Message) -> str:
 def _sanitise(name: str) -> str:
     """Make a decoded filename safe as a WebDAV object name and a Paperless filename."""
     # Sender-controlled text now heading for a URL path and a filesystem.
-    name = name.replace("/", "_").replace("\\", "_")
+    name = _UNSAFE_IN_PATH.sub("_", name)
     # Category C* is control/format/surrogate/unassigned — nothing that belongs
     # in a filename, and CR/LF would otherwise ride into a multipart header.
     name = "".join(c for c in name if unicodedata.category(c)[0] != "C")
