@@ -120,10 +120,17 @@ def test_attachment_filename_falls_back_when_absent():
 def test_attachment_filename_falls_back_on_malformed_encoded_word():
     # Unknown charset raises LookupError, bad base64 raises HeaderParseError.
     # Neither may cost the document, so the raw value is used instead.
-    for raw in ("=?bogus-charset?q?abc.pdf?=", "=?utf-8?b?!!!notbase64!!!?="):
+    # The `?` delimiters of the encoded word go with the rest: this fallback is
+    # the one path that reliably produced the unqueueable name of #58, because
+    # an encoded word carries `?` by construction.
+    cases = {
+        "=?bogus-charset?q?abc.pdf?=": "=_bogus-charset_q_abc.pdf_=.pdf",
+        "=?utf-8?b?!!!notbase64!!!?=": "=_utf-8_b_!!!notbase64!!!_=.pdf",
+    }
+    for raw, expected in cases.items():
         part = _raw_pdf_part(f'filename="{raw}"')
         # Ugly, but the document still reaches paperless with a .pdf suffix.
-        assert extract._attachment_filename(part) == f"{raw}.pdf"
+        assert extract._attachment_filename(part) == expected
 
 
 def test_attachment_filename_strips_rfc2231_charset_remnant():
@@ -165,3 +172,42 @@ def test_queue_message_pdfs_uses_the_decoded_filename_with_a_pdf_suffix(queue):
     assert extract.queue_message_pdfs(msg, "7", queue, "/q") == 1
     # `.pdf` is what keeps the object inside the scan flow's eligibility allowlist.
     queue.put.assert_called_once_with("/q/7-vorläufig.pdf", b"%PDF-1.4 sample")
+
+
+def test_attachment_filename_strips_characters_illegal_in_a_url_path():
+    """`?` and `#` end the path component; `%` starts an escape sequence (#58)."""
+    part = _raw_pdf_part('filename="=?utf-8?q?q=3Fa=23b=252Fc.pdf?="')
+    # The `%2F` matters as much as the `?`: left alone the server would decode
+    # it back to a separator the `/` replacement is there to stop.
+    assert extract._attachment_filename(part) == "q_a_b_2Fc.pdf"
+
+
+@respx.mock
+def test_queue_message_pdfs_puts_a_url_hostile_name_at_a_valid_stable_path():
+    """Regression for #58: a `?` in the name made httpx refuse to build the URL
+    ("Invalid URL component 'path'"), so every run failed and the same message
+    was re-picked the next hour. Goes through a real client on purpose — the
+    mocked queue elsewhere in this file never builds a URL, so it saw nothing.
+    """
+    msg = email.message_from_string(
+        "Content-Type: multipart/mixed; boundary=b\n"
+        "\n"
+        "--b\n"
+        "Content-Type: application/pdf\n"
+        'Content-Disposition: attachment; filename="what?now#2.pdf"\n'
+        "Content-Transfer-Encoding: base64\n"
+        "\n"
+        "JVBERi0xLjQgc2FtcGxl\n"
+        "--b--\n"
+    )
+    expected = "http://dav.test/dav.php/homes/scanner/mail/42-what_now_2.pdf"
+    route = respx.put(expected).mock(return_value=httpx.Response(204))
+    client = WebDAVClient("http://dav.test/dav.php", "scanner", "hunter2")
+
+    assert extract.queue_message_pdfs(msg, "42", client, "homes/scanner/mail") == 1
+    assert str(route.calls.last.request.url) == expected
+
+    # Deterministic: the retry the flow performs next run must overwrite that
+    # same object rather than land beside it (webdav.WebDAVClient.put).
+    assert extract.queue_message_pdfs(msg, "42", client, "homes/scanner/mail") == 1
+    assert str(route.calls.last.request.url) == expected
