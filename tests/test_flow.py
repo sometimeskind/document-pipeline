@@ -10,8 +10,10 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def prefect_test_env():
+    # The harness default is 30s, which is enough on CI but not on a slow box —
+    # the ephemeral server startup is the only thing this waits on.
     from prefect.testing.utilities import prefect_test_harness
-    with prefect_test_harness():
+    with prefect_test_harness(server_startup_timeout=180):
         yield
 
 
