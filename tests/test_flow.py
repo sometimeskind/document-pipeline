@@ -80,6 +80,7 @@ def test_mail_flow_queues_pdfs_flags_the_message_and_triggers_a_scan_run(monkeyp
         # The hop into Paperless is the scan flow's — kicked in-process, as /trigger-scan does.
         run.prefect.trigger_scan.assert_called_once()
         run.metrics.push_run_metrics.assert_called_once_with(1, 1, ANY)
+        run.metrics.push_failure_metrics.assert_not_called()
 
 
 def test_mail_flow_does_not_trigger_a_scan_run_when_nothing_was_queued(monkeypatch):
@@ -125,7 +126,11 @@ def test_mail_flow_leaves_a_message_unflagged_when_its_put_fails_and_fails_the_r
 
         run.imap.mark_processed.assert_called_once_with(run.conn, b"2")
         run.prefect.trigger_scan.assert_called_once()
+        # No success push — `last_success_timestamp` must stay frozen…
         run.metrics.push_run_metrics.assert_not_called()
+        # …but the run must still say it failed, or a pipeline failing every
+        # run is indistinguishable from an idle one (#60).
+        run.metrics.push_failure_metrics.assert_called_once_with()
 
 
 def test_mail_flow_flags_nothing_when_the_queue_directory_cannot_be_created(monkeypatch):
@@ -141,6 +146,7 @@ def test_mail_flow_flags_nothing_when_the_queue_directory_cannot_be_created(monk
 
         run.extract.queue_message_pdfs.assert_not_called()
         run.imap.mark_processed.assert_not_called()
+        run.metrics.push_failure_metrics.assert_called_once_with()
 
 
 def test_mail_flow_propagates_imap_timeout():
@@ -172,7 +178,10 @@ def test_mail_flow_skipped_when_pipeline_busy():
 
         mock_imap.fetch_unprocessed.assert_not_called()
         mock_extract.queue_message_pdfs.assert_not_called()
+        # A skip is neither a success nor a failure: a busy slot means the work
+        # is already in flight, so neither half of the group is pushed.
         mock_metrics.push_run_metrics.assert_not_called()
+        mock_metrics.push_failure_metrics.assert_not_called()
 
 
 def _enrich_env(monkeypatch):

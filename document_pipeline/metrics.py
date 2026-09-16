@@ -94,6 +94,50 @@ def push_run_metrics(
     _push(url, "mail-pipeline", registry)
 
 
+def push_failure_metrics() -> None:
+    """Push the failure half of the mail group. No-op when PUSHGATEWAY_URL is unset.
+
+    POST rather than PUT, for the same reason `push_enrich_metrics` uses it:
+    this is half a group, and replacing the whole `mail-pipeline` group here
+    would wipe `document_pipeline_last_success_timestamp` — the one gauge that
+    says how long the pipeline has been stalled. The success path still PUTs,
+    so a run that recovers clears these again and an alert on them resolves.
+
+    A failing run deliberately pushes no `last_success_timestamp`: leaving it
+    frozen is the point. Paired with a moving `last_failure_timestamp`, that is
+    what tells "no new mail" (fresh success, zero emails) apart from "every run
+    is failing" (stale success, fresh failure) — indistinguishable before #60.
+    """
+    url = os.environ.get("PUSHGATEWAY_URL", "")
+    if not url:
+        return
+
+    registry = CollectorRegistry()
+
+    Gauge(
+        "document_pipeline_last_failure_timestamp",
+        "Unix timestamp of the last failed mail-pipeline run",
+        registry=registry,
+    ).set(time.time())
+
+    prefect_url = os.environ.get("PREFECT_API_URL", "")
+    if prefect_url:
+        failures = _prefect_failures_24h(prefect_url)
+        if failures is not None:
+            gauge = Gauge(
+                "document_pipeline_prefect_failures_24h",
+                "Number of failed/crashed mail Prefect flow runs in the last 24 hours",
+                registry=registry,
+            )
+            # Plus this run: it is still Running while this pushes, so the query
+            # counting FAILED and CRASHED runs cannot see it yet, and the first
+            # failure after a quiet day would otherwise publish 0 — the exact
+            # reading that made the #58 outage look like an idle pipeline.
+            gauge.set(failures + 1)
+
+    _pushadd(url, "mail-pipeline", registry)
+
+
 def push_scan_metrics(sources: dict[str, SourceResult], duration_seconds: float) -> None:
     """Push per-run scan metrics to Pushgateway. No-op when PUSHGATEWAY_URL is unset.
 
