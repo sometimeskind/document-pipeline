@@ -9,8 +9,16 @@ logger = logging.getLogger(__name__)
 
 
 async def _submit(name: str, parameters: dict | None = None) -> None:
-    from prefect.deployments import run_deployment
-    await run_deployment(f"{name}/{name}", parameters=parameters, timeout=0)
+    # `arun_deployment`, not `run_deployment`: the latter is
+    # `@async_dispatch(arun_deployment)` and picks sync-vs-async from the
+    # Prefect *run context*, not the event loop. Called from inside a sync
+    # task — which is where `process-mail` triggers the scan flow from — it
+    # returns a `FlowRun` rather than a coroutine, and awaiting that raises
+    # `'FlowRun' object can't be awaited`. The run is submitted before the
+    # raise, so the symptom was `_trigger` reporting failure for a run it had
+    # just queued. The async variant is unconditional.
+    from prefect.deployments import arun_deployment
+    await arun_deployment(f"{name}/{name}", parameters=parameters, timeout=0)
 
 
 def _trigger(name: str, parameters: dict | None = None) -> bool:
