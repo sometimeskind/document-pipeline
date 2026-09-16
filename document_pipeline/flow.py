@@ -76,6 +76,11 @@ def push_metrics_task(messages_processed: int, pdfs_submitted: int, duration_sec
     metrics.push_run_metrics(messages_processed, pdfs_submitted, duration_seconds)
 
 
+@task(name="push-failure-metrics", log_prints=True)
+def push_failure_metrics_task() -> None:
+    metrics.push_failure_metrics()
+
+
 @flow(name="mail", log_prints=True)
 def mail_flow() -> None:
     logger = get_run_logger()
@@ -84,7 +89,16 @@ def mail_flow() -> None:
     try:
         with concurrency("mail-pipeline", occupy=1, timeout_seconds=10):
             slot_acquired = True
-            messages_processed, pdfs_submitted = process_mail_task()
+            try:
+                messages_processed, pdfs_submitted = process_mail_task()
+            except Exception:
+                # A Failed run must still say so in Prometheus. Pushing nothing
+                # freezes `document_pipeline_last_success_timestamp` and leaves
+                # `..._prefect_failures_24h` at 0, so a pipeline failing every
+                # run reads exactly like an idle one — which is how #58 ran 43
+                # hours unnoticed (#60). Shaped like enrich_flow's failure push.
+                push_failure_metrics_task()
+                raise
             push_metrics_task(messages_processed, pdfs_submitted, time.perf_counter() - flow_started)
         logger.info("mail flow complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
