@@ -4,7 +4,7 @@
 # mounted from a ConfigMap in kubernetes/davis/, the same way mail-sync's
 # trigger.sh is, so tuning the filter or the trigger URL never needs an image
 # rebuild. Runs as 33 (www-data) — the uid Davis owns the WebDAV homes as.
-FROM alpine:3.24.1
+FROM alpine:3.24.2
 
 RUN apk add --no-cache inotify-tools curl
 
