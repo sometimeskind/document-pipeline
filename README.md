@@ -242,7 +242,10 @@ derives the rest in code:
 - **tags** are matched against `/api/tags/`, fetched once per run,
   case- and whitespace-insensitively against **existing** names only. Unmatched
   names go to `suggested_tags` in the JSONL and are never applied or created —
-  the same rule and the same `vocab` harvest as `ai_suggestions`.
+  the same rule and the same `vocab` harvest as `ai_suggestions`. The
+  pipeline's own `queue` and `no-correspondent` are never matched, and the
+  written tag list goes through the same convergence as the default path, so
+  `queue` is always stripped.
 - **created** is written only when the model's answer is a real `YYYY-MM-DD`
   date, not in the future, and paperless's own `created` still equals the date
   the document was `added` — i.e. its date regex found nothing. A date
@@ -256,9 +259,9 @@ two paths are comparable from the JSONL alone.
 same ~20-document sample shows it matches or beats `suggest` on title quality
 (language, length, boilerplate), correspondent agreement and tag hit rate.
 `enrich-sweep` takes `mode` and `document_ids` for this: `document_ids`
-replaces the unenriched query with a fixed list and re-enriches those documents
-even though they are already marked or curated, and reports the model's
-correspondent past an existing assignment. It is refused unless `dry_run=true`,
+replaces the `queue` query with a fixed list and re-enriches those documents
+whether or not they still carry `queue` and even past a curated title, and
+reports the model's correspondent past an existing assignment. It is refused unless `dry_run=true`,
 so nothing is written. Both parameters leave `ENRICH_MODE` and the hourly sweep
 alone:
 

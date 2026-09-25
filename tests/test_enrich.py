@@ -1116,7 +1116,7 @@ def _mock_tag_list(pages=({"invoice": 5, "Shipping": 6},)):
 def _extract(*, dry_run=False, vocab=VOCAB, sample=False):
     with _client() as client:
         return enrich.enrich_document(
-            client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=dry_run,
+            client, PAPERLESS, DOC_ID, QUEUE_ID, dry_run=dry_run,
             tag_vocabulary=vocab, sample=sample,
         )
 
@@ -1165,11 +1165,11 @@ def test_match_tags_counts_a_repeated_name_once():
     assert unmatched == ["tax"]
 
 
-def test_match_tags_never_matches_the_pipelines_own_markers():
-    """The model naming `ai-processed` must not be what marks a document."""
-    vocab = {**VOCAB, enrich.MARKER_TAG: MARKER_ID, enrich.NO_CORRESPONDENT_TAG: 11}
+def test_match_tags_never_matches_the_pipelines_own_tags():
+    """The model naming `queue` or the decline tag must not be what applies it."""
+    vocab = {**VOCAB, enrich.QUEUE_TAG: QUEUE_ID, enrich.NO_CORRESPONDENT_TAG: 11}
     matched, unmatched = enrich.match_tags(
-        [enrich.MARKER_TAG, enrich.NO_CORRESPONDENT_TAG.upper()], vocab
+        [enrich.QUEUE_TAG, enrich.NO_CORRESPONDENT_TAG.upper()], vocab
     )
     assert matched == []
     assert unmatched == []
@@ -1232,7 +1232,7 @@ def test_created_accepts_a_datetime_shaped_created_field():
 @respx.mock
 def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
     _extract_env(monkeypatch)
-    _mock_extract_document(tags=(3,))
+    _mock_extract_document(tags=(3, QUEUE_ID))
     suggestions = _mock_suggestions()
     ollama = _mock_extraction(tags=("invoice", "Tax return"))
     _mock_correspondent_search(results=({"id": 17},))
@@ -1245,7 +1245,7 @@ def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
     request = json.loads(ollama.calls.last.request.content)
     assert request["format"]["required"] == ["title", "correspondent", "tags", "created"]
     assert json.loads(patch.calls.last.request.content) == {
-        "tags": [3, 5, MARKER_ID],
+        "tags": [3, 5],  # `queue` stripped: the document converged
         "title": "Factuur van Hermes",
         "correspondent": 17,
         "created": "2026-09-01",
@@ -1273,7 +1273,7 @@ def test_extract_mode_never_creates_a_tag(monkeypatch):
     result = _extract()
 
     assert not create_tag.called
-    assert json.loads(patch.calls.last.request.content)["tags"] == [3, MARKER_ID]
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3]
     assert result.suggested_tags == ["brand new tag"]
 
 
@@ -1290,7 +1290,7 @@ def test_extract_mode_fetches_the_vocabulary_when_not_handed_one(monkeypatch):
     _extract(vocab=None)
 
     assert tags.call_count == 1
-    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 6, MARKER_ID]
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 6]
 
 
 @respx.mock
@@ -1454,11 +1454,11 @@ def test_extract_mode_writes_the_pending_record_before_the_patch(monkeypatch, re
     assert record["previous_correspondent"] is None
     assert record["previous_created"] == "2026-09-20"
     assert record["title"] == "Factuur van Hermes"
-    assert record["tags"] == [3, 5, MARKER_ID]
+    assert record["tags"] == [3, 5]
     assert record["correspondent_id"] == 17
     assert record["created"] == "2026-09-01"
     assert result.outcome == "enriched"
-    assert (result.tags, result.correspondent_id) == ([3, 5, MARKER_ID], 17)
+    assert (result.tags, result.correspondent_id) == ([3, 5], 17)
     assert (result.previous_title, result.previous_tags, result.previous_created) == (
         "scan_0042", [3], "2026-09-20",
     )
@@ -1499,19 +1499,52 @@ def test_extract_mode_dry_run_carries_the_before_state_but_writes_no_record(
 
 
 @respx.mock
-def test_extract_mode_applies_the_marker_through_converged_tags(monkeypatch):
-    """One place decides what "converged" looks like (#1561 flips it there)."""
+def test_extract_mode_converges_through_converged_tags(monkeypatch):
+    """One place decides what "converged" looks like (#1561), extract path included."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3,))
     _mock_extraction(tags=("invoice",))
     _mock_correspondent_search(results=({"id": 17},))
     patch = _mock_patch()
-    monkeypatch.setattr(enrich, "converged_tags", lambda tags, marker_id: sorted(tags) + [777])
+    monkeypatch.setattr(enrich, "converged_tags", lambda tags, queue_id: sorted(tags) + [777])
 
     result = _extract()
 
     assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5, 777]
     assert result.tags == [3, 5, 777]
+
+
+@respx.mock
+def test_extract_mode_strips_queue_even_when_the_model_names_it(monkeypatch):
+    """`queue` is never matched in from the model, and always stripped (#1561)."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3, QUEUE_ID))
+    _mock_extraction(tags=("invoice", "queue", " QUEUE "))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract(vocab={**VOCAB, enrich.QUEUE_TAG: QUEUE_ID})
+
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
+    assert result.tags == [3, 5]
+    assert result.matched_tags == [5]
+    assert result.suggested_tags == []
+
+
+@respx.mock
+def test_extract_mode_strips_queue_from_a_matched_tag_that_slipped_through(monkeypatch):
+    """Belt and braces: converged_tags runs last, after the union with the matches."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,))
+    _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+    monkeypatch.setattr(enrich, "match_tags", lambda names, vocab: ([5, QUEUE_ID], []))
+
+    result = _extract()
+
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
+    assert result.tags == [3, 5]
 
 
 # the default path records its pass count too, so the gate can compare
@@ -1547,12 +1580,13 @@ def test_suggest_mode_pass_count_without_the_dedicated_queries(monkeypatch):
     assert _enrich().model_passes == 2
 
 
-# sample: dry-run re-enrichment of already-processed documents for the gate
+# sample: dry-run re-enrichment of already-enriched documents for the gate
 
 @respx.mock
-def test_sample_reenriches_a_marked_curated_document_on_a_dry_run(monkeypatch):
+def test_sample_reenriches_a_converged_curated_document_on_a_dry_run(monkeypatch):
+    """No `queue` left and a curated title: exactly the gate's sample documents."""
     _extract_env(monkeypatch)
-    _mock_extract_document(tags=(3, MARKER_ID), title="Factuur", original="scan.pdf",
+    _mock_extract_document(tags=(3,), title="Factuur", original="scan.pdf",
                            correspondent=4)
     ollama = _mock_extraction()
     patch = _mock_patch()
@@ -1570,14 +1604,14 @@ def test_sample_reenriches_a_marked_curated_document_on_a_dry_run(monkeypatch):
 def test_sample_in_suggest_mode_reenriches_too(monkeypatch):
     monkeypatch.delenv("ENRICH_MODE", raising=False)
     _fallback_env(monkeypatch)
-    _mock_document(tags=(MARKER_ID,), title="Factuur", correspondent=4)
+    _mock_document(tags=(3,), title="Factuur", correspondent=4)
     _mock_suggestions()
     _mock_ollama("Hermes")
     patch = _mock_patch()
 
     with _client() as client:
         result = enrich.enrich_document(
-            client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=True, sample=True
+            client, PAPERLESS, DOC_ID, QUEUE_ID, dry_run=True, sample=True
         )
 
     assert not patch.called
@@ -1588,7 +1622,7 @@ def test_sample_in_suggest_mode_reenriches_too(monkeypatch):
 def test_sample_refuses_to_write():
     with _client() as client:
         with pytest.raises(ValueError):
-            enrich.enrich_document(client, PAPERLESS, DOC_ID, MARKER_ID, sample=True)
+            enrich.enrich_document(client, PAPERLESS, DOC_ID, QUEUE_ID, sample=True)
 
 
 # the gate comparison over the JSONL
