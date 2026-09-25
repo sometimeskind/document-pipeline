@@ -8,7 +8,7 @@ into Python, so they are what these tests pin down.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import httpx
 import pytest
@@ -675,7 +675,8 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
     # Stamped at write time, in UTC — what `rollback --since` filters on.
     recorded_at = datetime.fromisoformat(first.pop("recorded_at"))
     assert recorded_at.utcoffset() == timedelta(0)
-    assert first == {
+    # A superset check: the #1563 gate fields are pinned in their own test.
+    assert first.items() >= {
         "document_id": DOC_ID,
         "outcome": "enriched",
         "title": "Invoice from Hermes",
@@ -688,7 +689,23 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
         "previous_correspondent": None,
         "tags": None,
         "correspondent_id": None,
-    }
+    }.items()
+
+
+def test_append_result_records_the_gate_fields(tmp_path):
+    """Mode and pass count are what the #1563 comparison reads back."""
+    target = tmp_path / "results.jsonl"
+    enrich.append_result(
+        enrich.EnrichResult(document_id=DOC_ID, outcome="dry-run", mode="extract",
+                            model_passes=1, created="2026-09-01",
+                            created_proposed="2026-09-01"),
+        path=str(target),
+    )
+    record = json.loads(target.read_text(encoding="utf-8"))
+    assert record["mode"] == "extract"
+    assert record["model_passes"] == 1
+    assert record["created"] == "2026-09-01"
+    assert record["created_proposed"] == "2026-09-01"
 
 
 def test_append_result_survives_an_unwritable_path(tmp_path):
@@ -1035,3 +1052,481 @@ def test_find_without_correspondent_queries_enriched_unmarked_documents():
     assert params["correspondent__isnull"] == "true"
     assert params["page_size"] == "8"
     assert params["ordering"] == "id"
+
+
+# --- ENRICH_MODE=extract: one structured query per document (homelab#1563) ---
+
+
+TODAY = date(2026, 9, 25)
+
+# A fixed vocabulary, keyed the way fetch_tag_vocabulary returns it.
+VOCAB = {"invoice": 5, "shipping": 6, "insurance": 7}
+
+
+def _extract_env(monkeypatch):
+    _fallback_env(monkeypatch)
+    monkeypatch.setenv("ENRICH_MODE", "extract")
+
+
+def _mock_extract_document(
+    *, content=_LONG_CONTENT, tags=(3,), correspondent=None,
+    created="2026-09-20", added="2026-09-20T14:03:12.123456+02:00", **kwargs,
+):
+    """A freshly consumed document whose created date paperless could not find."""
+    return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": DOC_ID,
+                "title": kwargs.get("title", "scan_0042"),
+                "content": content,
+                "tags": list(tags),
+                "original_file_name": kwargs.get("original", "scan_0042.pdf"),
+                "correspondent": correspondent,
+                "created": created,
+                "added": added,
+            },
+        )
+    )
+
+
+def _mock_extraction(
+    *, title="Factuur van Hermes", correspondent="Hermes", tags=("Invoice",), created="2026-09-01",
+):
+    return respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(200, json={"message": {"content": json.dumps({
+            "title": title, "correspondent": correspondent,
+            "tags": list(tags), "created": created,
+        })}})
+    )
+
+
+def _mock_tag_list(pages=({"invoice": 5, "Shipping": 6},)):
+    """Serve /api/tags/ as paginated results, one page per dict."""
+    responses = []
+    for i, page in enumerate(pages):
+        more = i + 1 < len(pages)
+        responses.append(httpx.Response(200, json={
+            "next": f"{PAPERLESS}/api/tags/?page={i + 2}" if more else None,
+            "results": [{"id": tag_id, "name": name} for name, tag_id in page.items()],
+        }))
+    return respx.get(f"{PAPERLESS}/api/tags/").mock(side_effect=responses)
+
+
+def _extract(*, dry_run=False, vocab=VOCAB, sample=False):
+    with _client() as client:
+        return enrich.enrich_document(
+            client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=dry_run,
+            tag_vocabulary=vocab, sample=sample,
+        )
+
+
+# mode selection
+
+def test_mode_defaults_to_suggest(monkeypatch):
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    assert enrich.resolve_mode(None) == "suggest"
+
+
+def test_mode_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ENRICH_MODE", "extract")
+    assert enrich.resolve_mode(None) == "extract"
+
+
+def test_an_explicit_mode_outranks_the_environment(monkeypatch):
+    """A flow-run parameter can dry-run the other path without an env change."""
+    monkeypatch.setenv("ENRICH_MODE", "extract")
+    assert enrich.resolve_mode("suggest") == "suggest"
+
+
+def test_an_unknown_mode_is_rejected_rather_than_silently_defaulted(monkeypatch):
+    monkeypatch.setenv("ENRICH_MODE", "extarct")
+    with pytest.raises(ValueError):
+        enrich.resolve_mode(None)
+
+
+# tag matching against a fixed vocabulary
+
+def test_match_tags_is_case_and_whitespace_insensitive():
+    matched, unmatched = enrich.match_tags(["INVOICE", "  shipping "], VOCAB)
+    assert matched == [5, 6]
+    assert unmatched == []
+
+
+def test_match_tags_records_unknown_names_and_never_invents_an_id():
+    matched, unmatched = enrich.match_tags(["Invoice", "Tax  return", ""], VOCAB)
+    assert matched == [5]
+    assert unmatched == ["Tax return"]
+
+
+def test_match_tags_counts_a_repeated_name_once():
+    matched, unmatched = enrich.match_tags(["invoice", "Invoice", "tax", "TAX"], VOCAB)
+    assert matched == [5]
+    assert unmatched == ["tax"]
+
+
+def test_match_tags_never_matches_the_pipelines_own_markers():
+    """The model naming `ai-processed` must not be what marks a document."""
+    vocab = {**VOCAB, enrich.MARKER_TAG: MARKER_ID, enrich.NO_CORRESPONDENT_TAG: 11}
+    matched, unmatched = enrich.match_tags(
+        [enrich.MARKER_TAG, enrich.NO_CORRESPONDENT_TAG.upper()], vocab
+    )
+    assert matched == []
+    assert unmatched == []
+
+
+@respx.mock
+def test_fetch_tag_vocabulary_follows_every_page():
+    route = _mock_tag_list(pages=({"invoice": 5}, {"Shipping": 6}))
+    with _client() as client:
+        vocab = enrich.fetch_tag_vocabulary(client, PAPERLESS)
+    assert vocab == {"invoice": 5, "shipping": 6}
+    assert route.call_count == 2
+
+
+# the created-date rule
+
+def _doc(created="2026-09-20", added="2026-09-20T14:03:12+02:00"):
+    return {"created": created, "added": added}
+
+
+def test_created_is_applied_when_paperless_fell_back_to_the_consume_date():
+    assert enrich.pick_created("2026-09-01", _doc(), TODAY) == "2026-09-01"
+
+
+def test_created_is_never_applied_over_a_date_paperless_found_itself():
+    assert enrich.pick_created("2026-09-01", _doc(created="2025-03-14"), TODAY) is None
+
+
+def test_created_in_the_future_is_rejected():
+    assert enrich.pick_created("2026-09-26", _doc(), TODAY) is None
+
+
+def test_created_today_is_accepted():
+    assert enrich.pick_created("2026-09-25", _doc(), TODAY) == "2026-09-25"
+
+
+@pytest.mark.parametrize("raw", ["", "2026-02-30", "01.09.2026", "September 2026",
+                                 "20260901", "2026-9-1", "2026-09-01T10:00:00"])
+def test_created_that_is_not_a_plain_valid_date_is_rejected(raw):
+    assert enrich.pick_created(raw, _doc(), TODAY) is None
+
+
+def test_created_equal_to_the_current_value_is_not_rewritten():
+    assert enrich.pick_created("2026-09-20", _doc(), TODAY) is None
+
+
+def test_created_is_left_alone_when_paperless_dates_are_missing():
+    assert enrich.pick_created("2026-09-01", {"created": None, "added": None}, TODAY) is None
+
+
+def test_created_accepts_a_datetime_shaped_created_field():
+    """Pre-2.16 paperless served `created` as a datetime; compare its date part."""
+    assert enrich.pick_created(
+        "2026-09-01", _doc(created="2026-09-20T00:00:00+02:00"), TODAY
+    ) == "2026-09-01"
+
+
+# enrich_document in extract mode
+
+@respx.mock
+def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,))
+    suggestions = _mock_suggestions()
+    ollama = _mock_extraction(tags=("invoice", "Tax return"))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert not suggestions.called
+    assert ollama.call_count == 1
+    request = json.loads(ollama.calls.last.request.content)
+    assert request["format"]["required"] == ["title", "correspondent", "tags", "created"]
+    assert json.loads(patch.calls.last.request.content) == {
+        "tags": [3, 5, MARKER_ID],
+        "title": "Factuur van Hermes",
+        "correspondent": 17,
+        "created": "2026-09-01",
+    }
+    assert result.outcome == "enriched"
+    assert result.mode == "extract"
+    assert result.model_passes == 1
+    assert result.matched_tags == [5]
+    assert result.suggested_tags == ["Tax return"]
+    assert result.correspondent == "Hermes"
+    assert result.created == "2026-09-01"
+
+
+@respx.mock
+def test_extract_mode_never_creates_a_tag(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(tags=("brand new tag",))
+    _mock_correspondent_search(results=({"id": 17},))
+    create_tag = respx.post(f"{PAPERLESS}/api/tags/").mock(
+        return_value=httpx.Response(201, json={"id": 99})
+    )
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert not create_tag.called
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, MARKER_ID]
+    assert result.suggested_tags == ["brand new tag"]
+
+
+@respx.mock
+def test_extract_mode_fetches_the_vocabulary_when_not_handed_one(monkeypatch):
+    """The trigger path enriches one document per run, so it fetches its own."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(tags=("shipping",))
+    tags = _mock_tag_list(pages=({"Shipping": 6},))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    _extract(vocab=None)
+
+    assert tags.call_count == 1
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 6, MARKER_ID]
+
+
+@respx.mock
+def test_extract_mode_leaves_a_created_date_paperless_found_alone(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(created="2025-03-14")
+    _mock_extraction(created="2026-09-01")
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert "created" not in json.loads(patch.calls.last.request.content)
+    assert result.created is None
+    assert result.created_proposed == "2026-09-01"
+
+
+@respx.mock
+def test_extract_mode_never_overwrites_an_existing_correspondent(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(correspondent=4)
+    _mock_extraction()
+    search = _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert not search.called
+    assert "correspondent" not in json.loads(patch.calls.last.request.content)
+    assert result.correspondent is None
+
+
+@respx.mock
+def test_extract_mode_creates_a_new_correspondent_unowned(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent="Cloudflare")
+    _mock_correspondent_search(results=())
+    create = _mock_correspondent_create(correspondent_id=31)
+    patch = _mock_patch()
+
+    _extract()
+
+    assert json.loads(create.calls.last.request.content) == {"name": "Cloudflare", "owner": None}
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 31
+
+
+@respx.mock
+def test_extract_mode_empty_title_raises_rather_than_patching(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(title="  ")
+    patch = _mock_patch()
+
+    with pytest.raises(ValueError):
+        _extract()
+    assert not patch.called
+
+
+@respx.mock
+def test_extract_mode_raises_on_an_ollama_failure(monkeypatch):
+    """No ai_suggestions to fall back to — the task retry is the fallback."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
+    patch = _mock_patch()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _extract()
+    assert not patch.called
+
+
+@respx.mock
+def test_extract_mode_raises_when_ollama_is_unconfigured(monkeypatch):
+    monkeypatch.setenv("ENRICH_MODE", "extract")
+    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
+    _mock_extract_document()
+    patch = _mock_patch()
+
+    with pytest.raises(RuntimeError):
+        _extract()
+    assert not patch.called
+
+
+@respx.mock
+def test_extract_mode_sends_capped_content(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(content="x" * 5000)
+    ollama = _mock_extraction()
+    _mock_correspondent_search(results=({"id": 17},))
+    _mock_patch()
+
+    _extract()
+
+    prompt = json.loads(ollama.calls.last.request.content)["messages"][0]["content"]
+    assert "x" * enrich.FALLBACK_CONTENT_CHARS in prompt
+    assert "x" * (enrich.FALLBACK_CONTENT_CHARS + 1) not in prompt
+
+
+@respx.mock
+def test_extract_mode_dry_run_writes_nothing(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent="Cloudflare", tags=("invoice", "tax"))
+    _mock_correspondent_search(results=())
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    result = _extract(dry_run=True)
+
+    assert not patch.called
+    assert not create.called
+    assert result.outcome == "dry-run"
+    assert result.mode == "extract"
+    assert result.title == "Factuur van Hermes"
+    assert result.matched_tags == [5]
+    assert result.suggested_tags == ["tax"]
+    assert result.correspondent == "Cloudflare"
+    assert result.created == "2026-09-01"
+
+
+@respx.mock
+def test_extract_mode_short_content_skips_the_query(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(content="too short")
+    ollama = _mock_extraction()
+    _mock_patch()
+
+    result = _extract()
+
+    assert not ollama.called
+    assert result.outcome == "skipped-short-content"
+    assert result.model_passes == 0
+
+
+# the default path records its pass count too, so the gate can compare
+
+@respx.mock
+def test_suggest_mode_records_its_model_passes(monkeypatch):
+    _fallback_env(monkeypatch)
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    _mock_document()
+    _mock_suggestions()  # no correspondent -> the fallback query fires too
+    _mock_ollama("Cloudflare")
+    _mock_correspondent_search(results=())
+    _mock_correspondent_create()
+    _mock_patch()
+
+    result = _enrich()
+
+    # ai_suggestions (classification + localization) + title + correspondent
+    assert result.mode == "suggest"
+    assert result.model_passes == 4
+
+
+@respx.mock
+def test_suggest_mode_pass_count_without_the_dedicated_queries(monkeypatch):
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
+    _mock_document()
+    _mock_suggestions(suggested_correspondents=("Hermes",))
+    _mock_correspondent_search(results=({"id": 17},))
+    _mock_patch()
+
+    assert _enrich().model_passes == 2
+
+
+# sample: dry-run re-enrichment of already-processed documents for the gate
+
+@respx.mock
+def test_sample_reenriches_a_marked_curated_document_on_a_dry_run(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3, MARKER_ID), title="Factuur", original="scan.pdf",
+                           correspondent=4)
+    ollama = _mock_extraction()
+    patch = _mock_patch()
+
+    result = _extract(dry_run=True, sample=True)
+
+    assert ollama.called
+    assert not patch.called
+    assert result.outcome == "dry-run"
+    # The existing assignment is reported past, so the gate can compare answers.
+    assert result.correspondent == "Hermes"
+
+
+@respx.mock
+def test_sample_in_suggest_mode_reenriches_too(monkeypatch):
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(MARKER_ID,), title="Factuur", correspondent=4)
+    _mock_suggestions()
+    _mock_ollama("Hermes")
+    patch = _mock_patch()
+
+    with _client() as client:
+        result = enrich.enrich_document(
+            client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=True, sample=True
+        )
+
+    assert not patch.called
+    assert result.outcome == "dry-run"
+    assert result.correspondent == "Hermes"
+
+
+def test_sample_refuses_to_write():
+    with _client() as client:
+        with pytest.raises(ValueError):
+            enrich.enrich_document(client, PAPERLESS, DOC_ID, MARKER_ID, sample=True)
+
+
+# the gate comparison over the JSONL
+
+def test_compare_modes_pairs_the_latest_dry_run_of_each_mode(tmp_path):
+    path = _write_results(tmp_path, [
+        {"document_id": 1, "outcome": "dry-run", "mode": "suggest", "title": "old",
+         "correspondent": "Hermes", "matched_tags": [], "suggested_tags": ["x"],
+         "model_passes": 4, "duration_seconds": 90.0},
+        {"document_id": 1, "outcome": "dry-run", "mode": "suggest", "title": "Invoice",
+         "correspondent": "Hermes", "matched_tags": [5], "suggested_tags": [],
+         "model_passes": 4, "duration_seconds": 100.0},
+        {"document_id": 1, "outcome": "dry-run", "mode": "extract", "title": "Factuur",
+         "correspondent": "hermes", "matched_tags": [5, 6], "suggested_tags": [],
+         "model_passes": 1, "duration_seconds": 30.0, "created": "2026-09-01"},
+        {"document_id": 2, "outcome": "dry-run", "mode": "extract", "title": "Lonely",
+         "model_passes": 1, "duration_seconds": 20.0},
+        {"document_id": 3, "outcome": "enriched", "mode": "suggest", "title": "Live"},
+        {"document_id": 4, "outcome": "dry-run", "title": "pre-1563 record"},
+    ])
+
+    pairs = enrich.compare_modes(path)
+
+    assert [p["document_id"] for p in pairs] == [1]
+    pair = pairs[0]
+    assert pair["suggest"]["title"] == "Invoice"
+    assert pair["extract"]["title"] == "Factuur"
+    assert pair["correspondent_agrees"] is True  # case-insensitive

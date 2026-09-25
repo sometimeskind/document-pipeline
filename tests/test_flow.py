@@ -314,6 +314,107 @@ def test_enrich_sweep_continues_past_a_failing_document(monkeypatch):
         mock_metrics.push_enrich_metrics.assert_called_once_with(2, False)
 
 
+def _sweep_mocks(mock_enrich, mock_concurrency):
+    from document_pipeline import enrich as real_enrich
+    mock_concurrency.return_value.__enter__.return_value = None
+    mock_concurrency.return_value.__exit__.return_value = False
+    mock_enrich.resolve_mode.side_effect = real_enrich.resolve_mode
+    mock_enrich.resolve_marker_tag.return_value = 9
+
+
+def test_enrich_sweep_in_extract_mode_fetches_the_tag_list_once(monkeypatch):
+    """homelab#1563: one /api/tags/ read per run, not per document."""
+    _enrich_env(monkeypatch)
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        _sweep_mocks(mock_enrich, mock_concurrency)
+        mock_enrich.find_unenriched.return_value = [1, 2]
+        mock_enrich.fetch_tag_vocabulary.return_value = {"invoice": 5}
+        mock_task.side_effect = [_result(1), _result(2)]
+
+        enrich_sweep_flow(batch_size=2, mode="extract")
+
+        mock_enrich.fetch_tag_vocabulary.assert_called_once()
+        for call in mock_task.call_args_list:
+            assert call.kwargs["mode"] == "extract"
+            assert call.kwargs["tag_vocabulary"] == {"invoice": 5}
+            assert call.kwargs["sample"] is False
+
+
+def test_enrich_sweep_in_suggest_mode_skips_the_tag_list(monkeypatch):
+    _enrich_env(monkeypatch)
+    monkeypatch.delenv("ENRICH_MODE", raising=False)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        _sweep_mocks(mock_enrich, mock_concurrency)
+        mock_enrich.find_unenriched.return_value = [1]
+        mock_task.return_value = _result(1)
+
+        enrich_sweep_flow(batch_size=1)
+
+        mock_enrich.fetch_tag_vocabulary.assert_not_called()
+        assert mock_task.call_args.kwargs["mode"] == "suggest"
+        assert mock_task.call_args.kwargs["tag_vocabulary"] is None
+
+
+def test_enrich_sweep_samples_named_documents_on_a_dry_run(monkeypatch):
+    """The gate's comparison: the same ids, already enriched, in either mode."""
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.metrics"), \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        _sweep_mocks(mock_enrich, mock_concurrency)
+        mock_task.side_effect = [_result(11), _result(12)]
+
+        enrich_sweep_flow(dry_run=True, mode="suggest", document_ids=[11, 12])
+
+        mock_enrich.find_unenriched.assert_not_called()
+        assert [c.args[0] for c in mock_task.call_args_list] == [11, 12]
+        assert all(c.kwargs["sample"] is True for c in mock_task.call_args_list)
+        assert all(c.args[2] is True for c in mock_task.call_args_list)  # dry_run
+
+
+def test_enrich_sweep_refuses_a_live_sample(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import enrich_sweep_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.enrich_document_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        _sweep_mocks(mock_enrich, mock_concurrency)
+
+        with pytest.raises(ValueError):
+            enrich_sweep_flow(document_ids=[11])
+        mock_task.assert_not_called()
+
+
+def test_enrich_task_passes_the_mode_through(monkeypatch):
+    from document_pipeline.flow import enrich_document_task
+    _enrich_env(monkeypatch)
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.get_run_logger"):
+        mock_enrich.enrich_document.return_value = _result()
+
+        enrich_document_task.fn(42, 9, True, mode="extract", tag_vocabulary={"a": 1}, sample=True)
+
+        kwargs = mock_enrich.enrich_document.call_args.kwargs
+        assert kwargs == {"dry_run": True, "mode": "extract",
+                          "tag_vocabulary": {"a": 1}, "sample": True}
+
+
 def test_enrich_sweep_batch_size_defaults_from_the_environment(monkeypatch):
     _enrich_env(monkeypatch)
     monkeypatch.setenv("ENRICH_SWEEP_BATCH_SIZE", "7")

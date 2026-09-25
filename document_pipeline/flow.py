@@ -156,7 +156,12 @@ def scan_flow() -> None:
 
 @task(name="enrich-document", retries=2, retry_delay_seconds=[60, 300], log_prints=True)
 def enrich_document_task(
-    document_id: int, queue_id: int | None = None, dry_run: bool = False
+    document_id: int,
+    queue_id: int | None = None,
+    dry_run: bool = False,
+    mode: str | None = None,
+    tag_vocabulary: dict[str, int] | None = None,
+    sample: bool = False,
 ) -> enrich.EnrichResult:
     """Retitle and tag one consumed document.
 
@@ -172,7 +177,8 @@ def enrich_document_task(
         if queue_id is None:
             queue_id = enrich.resolve_queue_tag(client, paperless_url)
         result = enrich.enrich_document(
-            client, paperless_url, document_id, queue_id, dry_run=dry_run
+            client, paperless_url, document_id, queue_id, dry_run=dry_run,
+            mode=mode, tag_vocabulary=tag_vocabulary, sample=sample,
         )
 
     enrich.append_result(result)
@@ -221,7 +227,12 @@ def enrich_flow(document_id: int) -> None:
 
 
 @flow(name="enrich-sweep", log_prints=True)
-def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> None:
+def enrich_sweep_flow(
+    batch_size: int | None = None,
+    dry_run: bool = False,
+    mode: str | None = None,
+    document_ids: list[int] | None = None,
+) -> None:
     """Enrich documents still carrying the `queue` tag.
 
     Belt and braces for a dropped trigger — and, run on a cron, this is the
@@ -232,10 +243,18 @@ def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> N
     gets reviewed before 2000-odd documents are retitled and renamed for real.
     Because a dry run leaves `queue` in place, it re-reads the same documents every
     time — it is a sample, not a pass over the library.
+
+    `mode` overrides ENRICH_MODE for this run, and `document_ids` replaces the
+    `queue` query with a fixed list, enriched whether or not it still carries
+    `queue` and even past a curated title (dry-run only). Together they are the homelab#1563 gate: the same
+    sample dry-run once per mode, then `python -m document_pipeline compare`.
     """
     logger = get_run_logger()
     flow_started = time.perf_counter()
     slot_acquired = False
+    if document_ids and not dry_run:
+        raise ValueError("document_ids re-enriches processed documents and needs dry_run=true")
+    mode = enrich.resolve_mode(mode)
     if batch_size is None:
         batch_size = int(os.environ.get("ENRICH_SWEEP_BATCH_SIZE", "20"))
 
@@ -246,7 +265,7 @@ def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> N
         # whatever this run does not reach, the next hour picks up.
         with concurrency("enrich-sweep", occupy=1, timeout_seconds=10):
             slot_acquired = True
-            _run_sweep(batch_size, dry_run)
+            _run_sweep(batch_size, dry_run, mode, document_ids)
         logger.info("enrich-sweep complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
         if not slot_acquired:
@@ -255,22 +274,35 @@ def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> N
             raise
 
 
-def _run_sweep(batch_size: int, dry_run: bool) -> None:
+def _run_sweep(
+    batch_size: int, dry_run: bool, mode: str, sample_ids: list[int] | None = None
+) -> None:
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
+    tag_vocabulary = None
     with enrich.open_client(_paperless_admin_token()) as client:
         queue_id = enrich.resolve_queue_tag(client, paperless_url)
-        document_ids = enrich.find_unenriched(client, paperless_url, queue_id, batch_size)
+        if sample_ids:
+            document_ids = [int(d) for d in sample_ids]
+        else:
+            document_ids = enrich.find_unenriched(client, paperless_url, queue_id, batch_size)
+        if mode == "extract":
+            # Once per run, not per document (homelab#1563).
+            tag_vocabulary = enrich.fetch_tag_vocabulary(client, paperless_url)
 
     logger.info(
-        "enrich-sweep: %d unenriched document(s), batch size %d%s",
-        len(document_ids), batch_size, " (DRY RUN — nothing will be written)" if dry_run else "",
+        "enrich-sweep: %d %s document(s), batch size %d, mode %s%s",
+        len(document_ids), "sampled" if sample_ids else "unenriched", batch_size, mode,
+        " (DRY RUN — nothing will be written)" if dry_run else "",
     )
     enriched = failed = 0
     for document_id in document_ids:
         try:
             with concurrency("ollama", occupy=1):
-                enrich_document_task(document_id, queue_id, dry_run)
+                enrich_document_task(
+                    document_id, queue_id, dry_run,
+                    mode=mode, tag_vocabulary=tag_vocabulary, sample=bool(sample_ids),
+                )
             enriched += 1
         except Exception as exc:
             # Per-document isolation: one document the LLM cannot handle must
