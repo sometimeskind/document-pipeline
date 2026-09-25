@@ -272,7 +272,7 @@ def _extract_record(**kw):
 
 def _mock_dated_document(created):
     return respx.get(f"{PAPERLESS}/api/documents/42/").mock(return_value=httpx.Response(200, json={
-        "id": 42, "title": "Invoice from Hermes", "tags": [3, 5, MARKER_ID],
+        "id": 42, "title": "Invoice from Hermes", "tags": [3, 5],
         "correspondent": 8, "created": created,
     }))
 
@@ -288,7 +288,7 @@ def test_an_extract_record_reverts_created_too():
     assert outcome.status == "reverted"
     assert json.loads(patch.calls.last.request.content) == {
         "title": "scan_0042",
-        "tags": [3, MARKER_ID, DECLINED_ID],
+        "tags": [3, DECLINED_ID],
         "correspondent": None,
         "created": "2026-09-20",
     }

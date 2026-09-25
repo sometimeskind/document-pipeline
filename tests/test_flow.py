@@ -319,7 +319,7 @@ def _sweep_mocks(mock_enrich, mock_concurrency):
     mock_concurrency.return_value.__enter__.return_value = None
     mock_concurrency.return_value.__exit__.return_value = False
     mock_enrich.resolve_mode.side_effect = real_enrich.resolve_mode
-    mock_enrich.resolve_marker_tag.return_value = 9
+    mock_enrich.resolve_queue_tag.return_value = 9
 
 
 def test_enrich_sweep_in_extract_mode_fetches_the_tag_list_once(monkeypatch):
@@ -383,6 +383,7 @@ def test_enrich_sweep_samples_named_documents_on_a_dry_run(monkeypatch):
         mock_enrich.find_unenriched.assert_not_called()
         assert [c.args[0] for c in mock_task.call_args_list] == [11, 12]
         assert all(c.kwargs["sample"] is True for c in mock_task.call_args_list)
+        assert all(c.args[1] == 9 for c in mock_task.call_args_list)  # queue_id
         assert all(c.args[2] is True for c in mock_task.call_args_list)  # dry_run
 
 
