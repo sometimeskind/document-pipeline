@@ -206,7 +206,7 @@ def test_enrich_task_records_every_result_to_the_jsonl(monkeypatch):
 
     with patch("document_pipeline.flow.enrich") as mock_enrich, \
          patch("document_pipeline.flow.get_run_logger"):
-        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_queue_tag.return_value = 9
         mock_enrich.enrich_document.return_value = _result()
 
         enrich_document_task.fn(42)
@@ -224,7 +224,7 @@ def test_enrich_task_prefers_the_admin_token_over_the_ingest_token(monkeypatch):
     with patch("document_pipeline.flow.enrich") as mock_enrich, \
          patch("document_pipeline.flow.get_run_logger"):
         mock_enrich.enrich_document.return_value = _result()
-        enrich_document_task.fn(42, marker_id=9)
+        enrich_document_task.fn(42, queue_id=9)
         mock_enrich.open_client.assert_called_once_with("superuser-tok")
 
 
@@ -237,7 +237,7 @@ def test_enrich_task_falls_back_to_the_ingest_token_when_unset(monkeypatch):
     with patch("document_pipeline.flow.enrich") as mock_enrich, \
          patch("document_pipeline.flow.get_run_logger"):
         mock_enrich.enrich_document.return_value = _result()
-        enrich_document_task.fn(42, marker_id=9)
+        enrich_document_task.fn(42, queue_id=9)
         mock_enrich.open_client.assert_called_once_with("ingest-tok")
 
 
@@ -302,7 +302,7 @@ def test_enrich_sweep_continues_past_a_failing_document(monkeypatch):
          patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
-        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_queue_tag.return_value = 9
         mock_enrich.find_unenriched.return_value = [1, 2, 3]
         mock_task.side_effect = [_result(1), ValueError("boom"), _result(3)]
 
@@ -360,7 +360,7 @@ def test_enrich_sweep_passes_dry_run_through_to_every_document(monkeypatch):
          patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
-        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_queue_tag.return_value = 9
         mock_enrich.find_unenriched.return_value = [1, 2]
         mock_task.side_effect = [_result(1), _result(2)]
 
@@ -381,7 +381,7 @@ def test_enrich_sweep_is_live_by_default(monkeypatch):
          patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
-        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_queue_tag.return_value = 9
         mock_enrich.find_unenriched.return_value = [1]
         mock_task.side_effect = [_result(1)]
 
@@ -426,7 +426,7 @@ def test_backfill_continues_past_a_failing_document_and_counts_outcomes(monkeypa
          patch("document_pipeline.flow.concurrency") as mock_concurrency:
         mock_concurrency.return_value.__enter__.return_value = None
         mock_concurrency.return_value.__exit__.return_value = False
-        mock_enrich.resolve_marker_tag.return_value = 9
+        mock_enrich.resolve_queue_tag.return_value = 9
         mock_enrich.resolve_declined_tag.return_value = 11
         mock_enrich.find_without_correspondent.return_value = [1, 2, 3]
         mock_task.side_effect = [

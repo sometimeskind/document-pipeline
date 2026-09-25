@@ -156,7 +156,7 @@ def scan_flow() -> None:
 
 @task(name="enrich-document", retries=2, retry_delay_seconds=[60, 300], log_prints=True)
 def enrich_document_task(
-    document_id: int, marker_id: int | None = None, dry_run: bool = False
+    document_id: int, queue_id: int | None = None, dry_run: bool = False
 ) -> enrich.EnrichResult:
     """Retitle and tag one consumed document.
 
@@ -169,10 +169,10 @@ def enrich_document_task(
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
-        if marker_id is None:
-            marker_id = enrich.resolve_marker_tag(client, paperless_url)
+        if queue_id is None:
+            queue_id = enrich.resolve_queue_tag(client, paperless_url)
         result = enrich.enrich_document(
-            client, paperless_url, document_id, marker_id, dry_run=dry_run
+            client, paperless_url, document_id, queue_id, dry_run=dry_run
         )
 
     enrich.append_result(result)
@@ -222,7 +222,7 @@ def enrich_flow(document_id: int) -> None:
 
 @flow(name="enrich-sweep", log_prints=True)
 def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> None:
-    """Enrich documents that carry no `ai-processed` marker.
+    """Enrich documents still carrying the `queue` tag.
 
     Belt and braces for a dropped trigger — and, run on a cron, this is the
     backfill over the pre-existing library (#1280): same code path, repeated,
@@ -230,7 +230,7 @@ def enrich_sweep_flow(batch_size: int | None = None, dry_run: bool = False) -> N
 
     `dry_run` reports what it would do and writes nothing, which is how a sample
     gets reviewed before 2000-odd documents are retitled and renamed for real.
-    Because a dry run leaves no marker, it re-reads the same documents every
+    Because a dry run leaves `queue` in place, it re-reads the same documents every
     time — it is a sample, not a pass over the library.
     """
     logger = get_run_logger()
@@ -259,8 +259,8 @@ def _run_sweep(batch_size: int, dry_run: bool) -> None:
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
-        marker_id = enrich.resolve_marker_tag(client, paperless_url)
-        document_ids = enrich.find_unenriched(client, paperless_url, marker_id, batch_size)
+        queue_id = enrich.resolve_queue_tag(client, paperless_url)
+        document_ids = enrich.find_unenriched(client, paperless_url, queue_id, batch_size)
 
     logger.info(
         "enrich-sweep: %d unenriched document(s), batch size %d%s",
@@ -270,7 +270,7 @@ def _run_sweep(batch_size: int, dry_run: bool) -> None:
     for document_id in document_ids:
         try:
             with concurrency("ollama", occupy=1):
-                enrich_document_task(document_id, marker_id, dry_run)
+                enrich_document_task(document_id, queue_id, dry_run)
             enriched += 1
         except Exception as exc:
             # Per-document isolation: one document the LLM cannot handle must
@@ -314,7 +314,7 @@ def correspondent_backfill_flow(batch_size: int | None = None, dry_run: bool = F
     """Assign correspondents to enriched documents that have none (#1373).
 
     Shaped like enrich_sweep_flow, over the complementary set: documents that
-    DO carry the `ai-processed` marker but no correspondent — everything
+    no longer carry `queue` but have no correspondent — everything
     enriched before the #1366 fallback, plus every document the sweep's
     fallback has declined since. Each is asked once more; a decline here is
     terminal (`no-correspondent` tag), so the set drains instead of cycling.
@@ -347,10 +347,10 @@ def _run_backfill(batch_size: int, dry_run: bool) -> None:
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
-        marker_id = enrich.resolve_marker_tag(client, paperless_url)
+        queue_id = enrich.resolve_queue_tag(client, paperless_url)
         declined_id = enrich.resolve_declined_tag(client, paperless_url)
         document_ids = enrich.find_without_correspondent(
-            client, paperless_url, marker_id, declined_id, batch_size
+            client, paperless_url, queue_id, declined_id, batch_size
         )
 
     logger.info(

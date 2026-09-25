@@ -106,12 +106,58 @@ def _rollback(argv: list[str]) -> None:
         print("DRY RUN — nothing was written. Re-run with --write to apply.")
 
 
+def _migrate_queue(argv: list[str]) -> None:
+    """One-off: give `queue` to every document without `ai-processed` (homelab#1561).
+
+    Run AFTER the image that queries on `queue` is deployed, then delete the
+    `ai-processed` tag in the paperless UI. Dry-run unless `--write`.
+
+        kubectl exec -n mail deploy/document-pipeline -- \\
+            python -m document_pipeline migrate-queue [--write]
+    """
+    import argparse
+
+    from document_pipeline import enrich, queue_migration
+
+    parser = argparse.ArgumentParser(
+        prog="python -m document_pipeline migrate-queue",
+        description="Tag every document without `ai-processed` with `queue`.",
+    )
+    parser.add_argument("--write", action="store_true", help="apply; default is a dry run")
+    args = parser.parse_args(argv)
+
+    paperless_url = os.environ["PAPERLESS_URL"]
+    token = os.environ.get("PAPERLESS_ADMIN_TOKEN") or os.environ["PAPERLESS_API_TOKEN"]
+    with enrich.open_client(token) as client:
+        m = queue_migration.run(client, paperless_url, write=args.write)
+
+    marker = queue_migration.LEGACY_MARKER_TAG
+    if m.marker_id is None:
+        print(f"No {marker!r} tag — already migrated, nothing to do.")
+        return
+    queue = f"id {m.queue_id}" if m.queue_id is not None else "missing, created on --write"
+    print(f"{marker!r}: id {m.marker_id}; {enrich.QUEUE_TAG!r}: {queue}")
+    ids = m.document_ids
+    shown = ", ".join(str(i) for i in ids[:20]) + (", ..." if len(ids) > 20 else "")
+    print(f"{len(ids)} document(s) without {marker!r} and not yet queued: {shown or 'none'}")
+    if not args.write:
+        if ids:
+            print("DRY RUN — nothing was written. Re-run with --write to apply.")
+        return
+    if m.written:
+        print(f"Added {enrich.QUEUE_TAG!r} to {len(ids)} document(s).")
+    print(f"Next: delete the {marker!r} tag in the paperless UI (Documents -> Tags).")
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "vocab":
         _print_vocab()
         return
     if len(sys.argv) > 1 and sys.argv[1] == "rollback":
         _rollback(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate-queue":
+        _migrate_queue(sys.argv[2:])
         return
 
     missing = [v for v in _REQUIRED if not os.environ.get(v)]

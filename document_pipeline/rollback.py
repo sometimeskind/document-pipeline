@@ -12,9 +12,15 @@ live library:
   after-state it wrote; if the document no longer looks like that, someone (or
   something) changed it since, and replaying the before-state would destroy
   their edit.
-- **A reverted document is left converged.** It keeps the sweep's marker, and a
-  correspondent reverted to none gets the backfill's decline tag — otherwise the
-  next hourly run would simply redo the write that was just undone.
+- **A reverted document is left converged.** It is left without the sweep's
+  `queue` tag, and a correspondent reverted to none gets the backfill's decline
+  tag — otherwise the next hourly run would simply redo the write that was just
+  undone.
+
+A record can name a tag that has since been deleted — every record written
+before #1561 carries the retired `ai-processed` marker's id. Such ids are dropped
+from both sides of the comparison and from the write, and reported in the detail,
+rather than failing the PATCH or reading as an edit made since.
 """
 
 from __future__ import annotations
@@ -109,32 +115,50 @@ def _expected_after(record: dict) -> dict:
 
 
 class _Tags:
-    """Resolves the two marker tags once, and never creates one on a dry run."""
+    """Resolves tags once, and never creates one on a dry run."""
 
     def __init__(self, client: httpx.Client, paperless_url: str, write: bool):
         self._client = client
         self._url = paperless_url
         self._write = write
         self._ids: dict[str, int | None] = {}
+        self._exists: dict[int, bool] = {}
 
-    def get(self, name: str) -> int | None:
+    def get(self, name: str, *, create: bool = True) -> int | None:
+        """The tag's id; created on a write run when `create`, else None if missing."""
         if name not in self._ids:
-            if self._write:
+            if self._write and create:
                 self._ids[name] = resolve_tag(self._client, self._url, name)
             else:
                 resp = self._client.get(f"{self._url}/api/tags/", params={"name__iexact": name})
                 resp.raise_for_status()
                 results = resp.json().get("results") or []
                 self._ids[name] = int(results[0]["id"]) if results else None
+            if self._ids[name] is not None:
+                self._exists[self._ids[name]] = True  # found, or just created
         return self._ids[name]
+
+    def existing(self, ids: set[int]) -> set[int]:
+        """The subset of `ids` that are still tags in paperless, cached per run."""
+        unseen = sorted(i for i in ids if i not in self._exists)
+        if unseen:
+            resp = self._client.get(
+                f"{self._url}/api/tags/",
+                params={"id__in": ",".join(str(i) for i in unseen), "page_size": len(unseen)},
+            )
+            resp.raise_for_status()
+            found = {int(r["id"]) for r in resp.json().get("results") or []}
+            self._exists.update({i: i in found for i in unseen})
+        return {i for i in ids if self._exists[i]}
 
 
 def _target(record: dict, expected: dict, tags: _Tags) -> dict:
     """The before-state, converged so the sweep and backfill leave it alone."""
     target_tags = list(record["previous_tags"])
-    marker_id = tags.get(enrich.MARKER_TAG)
-    if marker_id is not None:
-        target_tags = enrich.converged_tags(target_tags, marker_id)
+    # Never created just to be absent: a missing `queue` is already converged.
+    queue_id = tags.get(enrich.QUEUE_TAG, create=False)
+    if queue_id is not None:
+        target_tags = enrich.converged_tags(target_tags, queue_id)
     if record["previous_correspondent"] is None and expected["correspondent"] is not None:
         # A marked document with no correspondent is exactly what the backfill
         # queries for; without the decline tag it re-assigns the one just undone.
@@ -161,6 +185,15 @@ def revert_document(
 
     expected = _expected_after(record)
     target = _target(record, expected, tags)
+    named = set(expected["tags"]) | set(target["tags"])
+    deleted = sorted(named - tags.existing(named))
+    if deleted:
+        expected["tags"] = [t for t in expected["tags"] if t not in deleted]
+        target["tags"] = [t for t in target["tags"] if t not in deleted]
+    note = f"dropped deleted tag id(s) {deleted}" if deleted else ""
+
+    def detail(diff: str = "") -> str:
+        return "; ".join(part for part in (diff, note) if part)
 
     document = enrich.fetch_document(client, paperless_url, document_id)
     current = _state(
@@ -168,11 +201,13 @@ def revert_document(
     )
 
     if current == target:
-        return Reversion(document_id, "already-reverted", target)
+        return Reversion(document_id, "already-reverted", target, detail=detail())
     if current != expected:
-        return Reversion(document_id, "changed-since", target, detail=_diff(current, expected))
+        return Reversion(
+            document_id, "changed-since", target, detail=detail(_diff(current, expected))
+        )
     if not write:
-        return Reversion(document_id, "would-revert", target, detail=_diff(target, current))
+        return Reversion(document_id, "would-revert", target, detail=detail(_diff(target, current)))
 
     # Sent whole, correspondent included: None here means "clear it", unlike
     # patch_document where it means "leave it alone".
@@ -190,8 +225,8 @@ def revert_document(
             previous_correspondent=current["correspondent"],
         )
     )
-    logger.info("Document %s rolled back: %s", document_id, _diff(target, current))
-    return Reversion(document_id, "reverted", target, detail=_diff(target, current))
+    logger.info("Document %s rolled back: %s", document_id, detail(_diff(target, current)))
+    return Reversion(document_id, "reverted", target, detail=detail(_diff(target, current)))
 
 
 def run(
