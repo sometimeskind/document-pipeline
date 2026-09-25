@@ -227,6 +227,69 @@ Two things exist for the backfill specifically:
   flow-run parameter, not an env var, deliberately — the sweep's steady-state job
   is catching dropped triggers, and a dry-run default would silently disable it.
 
+### Single extraction query (`ENRICH_MODE=extract`, experiment — homelab#1563)
+
+The default path (`ENRICH_MODE=suggest`) costs four model passes per document:
+two inside `ai_suggestions` (classification, then localization), the dedicated
+title query and the correspondent query. `extract` asks Ollama **once**, with
+one schema requiring `{title, correspondent, tags: [string], created}`, and
+derives the rest in code:
+
+- **title** and **correspondent** use the dedicated prompts' wording verbatim
+  (document's own language, issuer never recipient, no legal suffixes). The
+  correspondent is applied only when the document has none, created unowned —
+  same as the default path.
+- **tags** are matched against `/api/tags/`, fetched once per run,
+  case- and whitespace-insensitively against **existing** names only. Unmatched
+  names go to `suggested_tags` in the JSONL and are never applied or created —
+  the same rule and the same `vocab` harvest as `ai_suggestions`. The
+  pipeline's own `queue` and `no-correspondent` are never matched, and the
+  written tag list goes through the same convergence as the default path, so
+  `queue` is always stripped.
+- **created** is written only when the model's answer is a real `YYYY-MM-DD`
+  date, not in the future, and paperless's own `created` still equals the date
+  the document was `added` — i.e. its date regex found nothing. A date
+  paperless parsed, or one set by hand, is never overwritten. The model's raw
+  answer is recorded as `created_proposed` either way.
+
+Every record carries `mode` and `model_passes` beside `duration_seconds`, so the
+two paths are comparable from the JSONL alone.
+
+**The gate.** `extract` is not the default until a dry-run comparison on the
+same ~20-document sample shows it matches or beats `suggest` on title quality
+(language, length, boilerplate), correspondent agreement and tag hit rate.
+`enrich-sweep` takes `mode` and `document_ids` for this: `document_ids`
+replaces the `queue` query with a fixed list and re-enriches those documents
+whether or not they still carry `queue` and even past a curated title, and
+reports the model's correspondent past an existing assignment. It is refused unless `dry_run=true`,
+so nothing is written. Both parameters leave `ENRICH_MODE` and the hourly sweep
+alone:
+
+```bash
+IDS='[101,102,103]'  # the ~20-document sample
+kubectl exec -n mail deploy/document-pipeline -- \
+  prefect deployment run enrich-sweep/enrich-sweep \
+  -p dry_run=true -p mode='"suggest"' -p document_ids="$IDS"
+# wait for that run to finish (Prefect UI), then:
+kubectl exec -n mail deploy/document-pipeline -- \
+  prefect deployment run enrich-sweep/enrich-sweep \
+  -p dry_run=true -p mode='"extract"' -p document_ids="$IDS"
+# then, side by side per document plus the totals:
+kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline compare
+```
+
+`-p` values are parsed as JSON, hence the inner quotes on the mode. `compare`
+pairs each document's latest `dry-run` record per mode, so re-running the
+sample supersedes the earlier one. A sample run takes the `ollama` slot like
+any sweep and is skipped if the hourly sweep holds the `enrich-sweep` slot.
+
+**Pending the gate:** `ai_suggestions`, `ENRICH_SUGGEST_TIMEOUT` and the
+`PAPERLESS_AI_*` env in homelab's `kubernetes/paperless/paperless.yaml` all
+stay until `extract` passes it and becomes the default — only then do they go
+(the Suggest button stops working; acceptable). If a 3B model with a
+four-field schema degrades titles, the fallback is two queries (facts + title),
+not four.
+
 ### Correspondent backfill
 
 `correspondent-backfill` covers the complementary set: documents that no longer
@@ -292,7 +355,9 @@ kubectl exec -n mail deploy/document-pipeline -- \
 
 It PATCHes `title`, `tags` and `correspondent` back to the recorded values for
 each `enriched`/`backfilled`/`pending` record since `--since` (a naive timestamp is
-UTC); the **newest record per document wins**. Three rules keep it safe on a live
+UTC); the **newest record per document wins**. Extract-mode records (#1563) also
+carry `previous_created`; when the write set `created`, rollback restores it too
+and counts a `created` changed since as an edit. Three rules keep it safe on a live
 library:
 
 - **A document edited since is skipped and reported (`changed-since`)**, with the
@@ -381,7 +446,8 @@ the second) rather than a walk over the task list.
 | `PAPERLESS_ADMIN_TOKEN` | no | falls back to `PAPERLESS_API_TOKEN` | Superuser Paperless token used by `enrich` |
 | `ENRICH_SWEEP_CRON` | no | unset → sweep has no schedule | Cron for the `enrich-sweep` deployment |
 | `ENRICH_SWEEP_BATCH_SIZE` | no | `20` | Documents per sweep run |
-| `ENRICH_SUGGEST_TIMEOUT` | no | `650` | Read timeout for `ai_suggestions`, in seconds |
+| `ENRICH_MODE` | no | `suggest` | `suggest` (ai_suggestions + dedicated queries) or `extract` (one structured query, needs the Ollama vars; homelab#1563). Unknown values fail the run |
+| `ENRICH_SUGGEST_TIMEOUT` | no | `650` | Read timeout for `ai_suggestions`, in seconds (unused by `extract`; removal pending the #1563 gate) |
 | `ENRICH_OLLAMA_URL` | no | unset → dedicated title/correspondent queries off | Ollama base URL for the queries enrich runs itself |
 | `ENRICH_OLLAMA_MODEL` | no | unset → dedicated title/correspondent queries off | Model for those queries |
 | `ENRICH_FALLBACK_TIMEOUT` | no | `300` | Read timeout for the dedicated Ollama queries, in seconds |

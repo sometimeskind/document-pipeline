@@ -149,6 +149,63 @@ def _migrate_queue(argv: list[str]) -> None:
     print(f"Next: delete the {marker!r} tag in the paperless UI (Documents -> Tags).")
 
 
+def _print_comparison() -> None:
+    """Side-by-side of the latest `suggest` and `extract` dry runs (homelab#1563).
+
+    The gate: title quality, correspondent agreement and tag hit rate per
+    document, and the pass count and wall time that are the point of the
+    experiment. Run the same `document_ids` sample once per mode first (README).
+
+        kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline compare
+    """
+    from document_pipeline import enrich
+
+    try:
+        pairs = enrich.compare_modes()
+    except FileNotFoundError:
+        logger.error("No enrich results yet — nothing has run.")
+        sys.exit(1)
+    if not pairs:
+        logger.error("No document has a dry run in both modes yet.")
+        sys.exit(1)
+
+    for pair in pairs:
+        s, e = pair["suggest"], pair["extract"]
+        agrees = {True: "=", False: "≠", None: "?"}[pair["correspondent_agrees"]]
+        print(
+            f"#{pair['document_id']}  passes {s.get('model_passes', 0)} -> "
+            f"{e.get('model_passes', 0)}  time {s.get('duration_seconds', 0):.1f}s -> "
+            f"{e.get('duration_seconds', 0):.1f}s  correspondent {agrees} "
+            f"({s.get('correspondent')} | {e.get('correspondent')})"
+        )
+        for label, record in (("suggest", s), ("extract", e)):
+            created = f"  created {record.get('created')}" if record.get("created") else ""
+            print(
+                f"    {label}: {record.get('title')!r}  tags "
+                f"{len(record.get('matched_tags') or [])} matched / "
+                f"{len(record.get('suggested_tags') or [])} unmatched{created}"
+            )
+
+    n = len(pairs)
+    compared = [p["correspondent_agrees"] for p in pairs if p["correspondent_agrees"] is not None]
+
+    def total(mode: str, key: str) -> float:
+        return sum(p[mode].get(key) or 0 for p in pairs)
+
+    def tag_hits(mode: str) -> int:
+        return sum(1 for p in pairs if p[mode].get("matched_tags"))
+
+    print()
+    print(f"{n} document(s) with a dry run in both modes")
+    print(f"model passes     suggest {total('suggest', 'model_passes'):.0f}  "
+          f"extract {total('extract', 'model_passes'):.0f}")
+    print(f"mean time        suggest {total('suggest', 'duration_seconds') / n:.1f}s  "
+          f"extract {total('extract', 'duration_seconds') / n:.1f}s")
+    print(f"correspondent    {sum(compared)}/{len(compared)} agree")
+    print(f"docs with a tag  suggest {tag_hits('suggest')}/{n}  extract {tag_hits('extract')}/{n}")
+    print(f"created set      extract {sum(1 for p in pairs if p['extract'].get('created'))}/{n}")
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "vocab":
         _print_vocab()
@@ -158,6 +215,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "migrate-queue":
         _migrate_queue(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        _print_comparison()
         return
 
     missing = [v for v in _REQUIRED if not os.environ.get(v)]

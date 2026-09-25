@@ -265,6 +265,59 @@ def test_a_backfilled_record_reverts_only_what_it_changed():
     }
 
 
+def _extract_record(**kw):
+    """An extract-mode record (#1563) that also wrote `created`."""
+    return _record(mode="extract", created="2026-09-01", previous_created="2026-09-20", **kw)
+
+
+def _mock_dated_document(created):
+    return respx.get(f"{PAPERLESS}/api/documents/42/").mock(return_value=httpx.Response(200, json={
+        "id": 42, "title": "Invoice from Hermes", "tags": [3, 5],
+        "correspondent": 8, "created": created,
+    }))
+
+
+@respx.mock
+def test_an_extract_record_reverts_created_too():
+    _mock_tags()
+    _mock_dated_document("2026-09-01")
+    patch = _mock_patch()
+
+    [outcome] = _run({42: _extract_record()}, write=True)
+
+    assert outcome.status == "reverted"
+    assert json.loads(patch.calls.last.request.content) == {
+        "title": "scan_0042",
+        "tags": [3, DECLINED_ID],
+        "correspondent": None,
+        "created": "2026-09-20",
+    }
+
+
+@respx.mock
+def test_a_created_date_changed_since_counts_as_an_edit():
+    _mock_tags()
+    _mock_dated_document("2026-08-15")
+    patch = _mock_patch()
+
+    [outcome] = _run({42: _extract_record()}, write=True)
+
+    assert outcome.status == "changed-since"
+    assert "created" in outcome.detail
+    assert not patch.called
+
+
+@respx.mock
+def test_an_extract_record_that_left_created_alone_does_not_touch_it():
+    _mock_tags()
+    _mock_dated_document("2026-09-20")
+    patch = _mock_patch()
+
+    _run({42: _record(mode="extract", created=None, previous_created="2026-09-20")}, write=True)
+
+    assert "created" not in json.loads(patch.calls.last.request.content)
+
+
 @respx.mock
 def test_a_document_edited_since_is_skipped_and_reported():
     _mock_tags()
