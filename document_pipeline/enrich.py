@@ -121,8 +121,12 @@ class EnrichResult:
     model_passes: int = 0
     # Extract mode only: the date written to `created` (or, on a dry run, that
     # would be), and the model's raw answer whether or not the rule accepted it.
+    # `created` doubles as the after-state for rollback: None means not written.
     created: str | None = None
     created_proposed: str | None = None
+    # The document's `created` before the write, beside the other previous_*
+    # fields; rollback restores it only when `created` above was written.
+    previous_created: str | None = None
 
 
 def resolve_mode(mode: str | None) -> str:
@@ -201,6 +205,7 @@ def previous_state(document: dict) -> dict:
         "previous_title": document.get("title"),
         "previous_tags": [int(t) for t in document.get("tags") or []],
         "previous_correspondent": document.get("correspondent"),
+        "previous_created": document.get("created"),
     }
 
 
@@ -907,6 +912,19 @@ def _enrich_by_extraction(
         if not dry_run:
             correspondent_id = resolve_correspondent(client, paperless_url, correspondent_name)
 
+    result = EnrichResult(
+        document_id=document_id,
+        outcome="dry-run",
+        title=title,
+        matched_tags=matched_tags,
+        suggested_tags=suggested_tags,
+        correspondent=correspondent_name,
+        mode="extract",
+        model_passes=1,
+        created=created,
+        created_proposed=facts.created,
+        **previous_state(document),
+    )
     if dry_run:
         logger.info(
             "Document %s WOULD be retitled -> %r (tags: %s + %s, unmatched: %s, "
@@ -914,33 +932,29 @@ def _enrich_by_extraction(
             document_id, title, existing_tags or "none", matched_tags or "none",
             suggested_tags or "none", correspondent_name or "none", created or "unchanged",
         )
-        outcome = "dry-run"
-    else:
-        patch_document(
-            client, paperless_url, document_id,
-            converged_tags(merge_tags(existing_tags, matched_tags), queue_id),
-            title=title, correspondent=correspondent_id, created=created,
-        )
-        logger.info(
-            "Document %s retitled -> %r (tags: %s + %s, correspondent: %s, created: %s) [extract]",
-            document_id, title, existing_tags or "none", matched_tags or "none",
-            correspondent_name or "none", created or "unchanged",
-        )
-        outcome = "enriched"
+        result.duration_seconds = time.perf_counter() - started
+        return result
 
-    return EnrichResult(
-        document_id=document_id,
-        outcome=outcome,
-        title=title,
-        matched_tags=matched_tags,
-        suggested_tags=suggested_tags,
-        correspondent=correspondent_name,
-        duration_seconds=time.perf_counter() - started,
-        mode="extract",
-        model_passes=1,
-        created=created,
-        created_proposed=facts.created,
+    # converged_tags goes last, as on the suggest path (#1561): it strips
+    # `queue` even if the model's tags somehow carried it back in.
+    tags = converged_tags(merge_tags(existing_tags, matched_tags), queue_id)
+    result.outcome = "enriched"
+    result.tags = tags
+    result.correspondent_id = correspondent_id
+    # Before the PATCH, like the default path (#1562): a crash mid-PATCH still
+    # leaves the before-state, `created` included, on disk.
+    append_result(replace(result, outcome=PENDING_OUTCOME))
+    patch_document(
+        client, paperless_url, document_id, tags,
+        title=title, correspondent=correspondent_id, created=created,
     )
+    logger.info(
+        "Document %s retitled -> %r (tags: %s + %s, correspondent: %s, created: %s) [extract]",
+        document_id, title, existing_tags or "none", matched_tags or "none",
+        correspondent_name or "none", created or "unchanged",
+    )
+    result.duration_seconds = time.perf_counter() - started
+    return result
 
 
 def backfill_correspondent(
