@@ -17,7 +17,8 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -65,6 +66,12 @@ DEFAULT_SUGGEST_TIMEOUT = 650.0
 
 DEFAULT_RESULTS_PATH = "/state/enrich/results.jsonl"
 
+# Outcome of the record appended just BEFORE a title/correspondent PATCH (#1562),
+# so a crash mid-PATCH still leaves the before-state on disk. The task appends the
+# real outcome after; `rollback` treats a pending record as revertible because its
+# "changed since" check tells a PATCH that landed from one that did not.
+PENDING_OUTCOME = "pending"
+
 
 @dataclass
 class EnrichResult:
@@ -84,6 +91,16 @@ class EnrichResult:
     # pick_correspondent for why that is not the vocabulary-growth mistake.
     correspondent: str | None = None
     duration_seconds: float = 0.0
+    # The document as `fetch_document` returned it, before anything was
+    # written (#1562) — what `rollback` restores. Set on every outcome that got
+    # that far, so a record is self-describing.
+    previous_title: str | None = None
+    previous_tags: list[int] | None = None
+    previous_correspondent: int | None = None
+    # The written after-state as ids, for rollback's "edited since?" check.
+    # None means this write did not touch the field, like patch_document's rule.
+    tags: list[int] | None = None
+    correspondent_id: int | None = None
 
 
 def open_client(paperless_token: str, suggest_timeout: float | None = None) -> httpx.Client:
@@ -141,9 +158,29 @@ def patch_document(
     resp.raise_for_status()
 
 
+def previous_state(document: dict) -> dict:
+    """The before-state fields of an EnrichResult, from a fetched document."""
+    return {
+        "previous_title": document.get("title"),
+        "previous_tags": [int(t) for t in document.get("tags") or []],
+        "previous_correspondent": document.get("correspondent"),
+    }
+
+
 def normalize_title(raw: str | None) -> str:
     """Collapse whitespace and truncate to what the column will hold."""
     return " ".join((raw or "").split())[:MAX_TITLE_CHARS]
+
+
+def converged_tags(tags: list[int], marker_id: int) -> list[int]:
+    """`tags` with the sweep's convergence marker applied.
+
+    The one place that decides what "done, don't pick it again" looks like on
+    a tag list; `rollback` goes through it to leave a reverted document
+    converged. When the marker becomes a `queue` tag whose ABSENCE means done
+    (#1561), this is what flips.
+    """
+    return sorted({int(t) for t in tags} | {int(marker_id)})
 
 
 def merge_tags(existing: list[int], matched: list[int], marker_id: int) -> list[int]:
@@ -470,6 +507,7 @@ def enrich_document(
             document_id=document_id,
             outcome="skipped-curated-title",
             duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
         )
 
     content_length = len((document.get("content") or "").strip())
@@ -488,6 +526,7 @@ def enrich_document(
             document_id=document_id,
             outcome="skipped-short-content",
             duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
         )
 
     suggestions = fetch_suggestions(client, paperless_url, document_id)
@@ -542,9 +581,22 @@ def enrich_document(
             suggested_tags=suggested_tags,
             correspondent=correspondent_name,
             duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
         )
 
     tags = merge_tags(existing_tags, matched_tags, marker_id)
+    result = EnrichResult(
+        document_id=document_id,
+        outcome="enriched",
+        title=title,
+        matched_tags=matched_tags,
+        suggested_tags=suggested_tags,
+        correspondent=correspondent_name,
+        tags=tags,
+        correspondent_id=correspondent_id,
+        **previous_state(document),
+    )
+    append_result(replace(result, outcome=PENDING_OUTCOME))
     patch_document(
         client, paperless_url, document_id, tags, title=title, correspondent=correspondent_id
     )
@@ -554,15 +606,8 @@ def enrich_document(
         document_id, title, existing_tags or "none", matched_tags or "none",
         correspondent_name or "none",
     )
-    return EnrichResult(
-        document_id=document_id,
-        outcome="enriched",
-        title=title,
-        matched_tags=matched_tags,
-        suggested_tags=suggested_tags,
-        correspondent=correspondent_name,
-        duration_seconds=time.perf_counter() - started,
-    )
+    result.duration_seconds = time.perf_counter() - started
+    return result
 
 
 def backfill_correspondent(
@@ -625,6 +670,7 @@ def backfill_correspondent(
             document_id=document_id,
             outcome=outcome,
             duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
         )
 
     if dry_run:
@@ -634,17 +680,22 @@ def backfill_correspondent(
             outcome="dry-run",
             correspondent=name,
             duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
         )
 
     correspondent_id = resolve_correspondent(client, paperless_url, name)
-    patch_document(client, paperless_url, document_id, correspondent=correspondent_id)
-    logger.info("Document %s assigned correspondent %r", document_id, name)
-    return EnrichResult(
+    result = EnrichResult(
         document_id=document_id,
         outcome=outcome,
         correspondent=name,
-        duration_seconds=time.perf_counter() - started,
+        correspondent_id=correspondent_id,
+        **previous_state(document),
     )
+    append_result(replace(result, outcome=PENDING_OUTCOME))
+    patch_document(client, paperless_url, document_id, correspondent=correspondent_id)
+    logger.info("Document %s assigned correspondent %r", document_id, name)
+    result.duration_seconds = time.perf_counter() - started
+    return result
 
 
 def resolve_marker_tag(client: httpx.Client, paperless_url: str) -> int:
@@ -661,12 +712,17 @@ def append_result(result: EnrichResult, path: str | None = None) -> None:
     stdout cannot carry this: the log goes to the paperless webserver pod and
     does not survive a restart, and the #1292 harvest needs a `doc_id -> [names]`
     mapping that outlives both.
+
+    Stamped with `recorded_at` (UTC) here rather than on the dataclass, so the
+    pre-PATCH record and the outcome record each carry their own write time.
     """
     target = Path(path or os.environ.get("ENRICH_RESULTS_PATH", DEFAULT_RESULTS_PATH))
+    record = {"recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    record.update(asdict(result))
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
         # The record is an artifact, not the job. Losing a line must not cost
         # the document its title.
@@ -706,6 +762,8 @@ def rank_suggested_tags(path: str | None = None) -> tuple[int, list[tuple[str, i
                 # harvest — every earlier line is still good.
                 logger.warning("Skipping malformed line in %s", target)
                 continue
+            if record.get("outcome") == PENDING_OUTCOME:
+                continue  # repeated by the outcome record that follows it
             documents.add(record.get("document_id"))
             names = [n.strip() for n in record.get("suggested_tags") or [] if n.strip()]
             for key in {n.lower() for n in names}:

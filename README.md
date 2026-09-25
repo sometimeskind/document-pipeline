@@ -255,6 +255,49 @@ kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline voc
 Tagging cannot bootstrap itself — `match_tags_by_name` only matches tags that
 already exist — so those names have to be created before matching can ever fire.
 
+### Rollback
+
+Every record carries the document's state **before** the write —
+`previous_title`, `previous_tags` and `previous_correspondent` (ids), straight from
+the fetch the write started with — plus the after-state it wrote as ids (`tags`,
+`correspondent_id`; `null` means "this write did not touch it") and a UTC
+`recorded_at`. For the two writes that change content (`enriched`, `backfilled`)
+a `pending` copy of the record is appended **before** the PATCH and the real
+outcome after it, so a pod killed mid-PATCH still leaves the before-state on disk.
+
+That makes a bad batch — a regressed prompt, a wrong model tag — revertible
+without a Velero restore:
+
+```bash
+# Dry run: lists what would be reverted, writes nothing
+kubectl exec -n mail deploy/document-pipeline -- \
+  python -m document_pipeline rollback --since 2026-09-20T00:00:00Z [--document 1234]
+# Apply
+kubectl exec -n mail deploy/document-pipeline -- \
+  python -m document_pipeline rollback --since 2026-09-20T00:00:00Z --write
+```
+
+It PATCHes `title`, `tags` and `correspondent` back to the recorded values for
+each `enriched`/`backfilled`/`pending` record since `--since` (a naive timestamp is
+UTC); the **newest record per document wins**. Three rules keep it safe on a live
+library:
+
+- **A document edited since is skipped and reported (`changed-since`)**, with the
+  fields that differ. If its title, tags or correspondent no longer match what the
+  record wrote, replaying the before-state would destroy that edit. A `pending`
+  record whose PATCH never landed is skipped the same way.
+- **A reverted document is left converged.** It keeps the `ai-processed` marker
+  (applied through `enrich.converged_tags`) so the sweep does not redo it, and a
+  correspondent reverted to none also gets `no-correspondent` so the backfill
+  does not reassign it.
+- **A dry run creates nothing**, not even a missing `no-correspondent` tag.
+
+`--write` appends a `rolled-back` record (itself carrying the before-state), and a
+second run reports `already-reverted`. Created correspondents are left in place —
+they are unowned and harmless — and the file rename undoes itself: paperless
+re-renders the filename on the PATCH. Records from before this existed carry no
+`recorded_at` or before-state and are never matched.
+
 ## Paperless task-queue health (`paperless-health` flow)
 
 Paperless exposes no metrics, but its `/api/tasks/` is the source of truth for
