@@ -352,7 +352,9 @@ kubectl exec -n mail deploy/document-pipeline -- \
 
 It PATCHes `title`, `tags` and `correspondent` back to the recorded values for
 each `enriched`/`backfilled`/`pending` record since `--since` (a naive timestamp is
-UTC); the **newest record per document wins**. Three rules keep it safe on a live
+UTC); the **newest record per document wins**. Extract-mode records (#1563) also
+carry `previous_created`; when the write set `created`, rollback restores it too
+and counts a `created` changed since as an edit. Three rules keep it safe on a live
 library:
 
 - **A document edited since is skipped and reported (`changed-since`)**, with the

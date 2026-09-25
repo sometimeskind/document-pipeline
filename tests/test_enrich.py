@@ -1427,6 +1427,93 @@ def test_extract_mode_short_content_skips_the_query(monkeypatch):
     assert result.model_passes == 0
 
 
+# extract mode records the before-state like the default path (#1562)
+
+@respx.mock
+def test_extract_mode_writes_the_pending_record_before_the_patch(monkeypatch, results_path):
+    """Same crash-safety as the default path, plus `created`, which only extract writes."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,), created="2026-09-20")
+    _mock_extraction(tags=("invoice",), created="2026-09-01")
+    _mock_correspondent_search(results=({"id": 17},))
+    seen_at_patch_time = []
+
+    def respond(request):
+        seen_at_patch_time.extend(_records(results_path))
+        return httpx.Response(200, json={"id": DOC_ID})
+
+    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(side_effect=respond)
+
+    result = _extract()
+
+    [record] = seen_at_patch_time
+    assert record["outcome"] == enrich.PENDING_OUTCOME
+    assert record["mode"] == "extract"
+    assert record["previous_title"] == "scan_0042"
+    assert record["previous_tags"] == [3]
+    assert record["previous_correspondent"] is None
+    assert record["previous_created"] == "2026-09-20"
+    assert record["title"] == "Factuur van Hermes"
+    assert record["tags"] == [3, 5, MARKER_ID]
+    assert record["correspondent_id"] == 17
+    assert record["created"] == "2026-09-01"
+    assert result.outcome == "enriched"
+    assert (result.tags, result.correspondent_id) == ([3, 5, MARKER_ID], 17)
+    assert (result.previous_title, result.previous_tags, result.previous_created) == (
+        "scan_0042", [3], "2026-09-20",
+    )
+
+
+@respx.mock
+def test_extract_mode_failed_patch_still_leaves_the_pending_record(monkeypatch, results_path):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction()
+    _mock_correspondent_search(results=({"id": 17},))
+    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _extract()
+
+    assert [r["outcome"] for r in _records(results_path)] == [enrich.PENDING_OUTCOME]
+
+
+@respx.mock
+def test_extract_mode_dry_run_carries_the_before_state_but_writes_no_record(
+    monkeypatch, results_path
+):
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,), correspondent=4)
+    _mock_extraction()
+
+    result = _extract(dry_run=True)
+
+    assert _records(results_path) == []
+    assert (result.previous_title, result.previous_tags, result.previous_correspondent) == (
+        "scan_0042", [3], 4,
+    )
+    # Nothing written, so no after-state ids.
+    assert (result.tags, result.correspondent_id) == (None, None)
+
+
+@respx.mock
+def test_extract_mode_applies_the_marker_through_converged_tags(monkeypatch):
+    """One place decides what "converged" looks like (#1561 flips it there)."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,))
+    _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+    monkeypatch.setattr(enrich, "converged_tags", lambda tags, marker_id: sorted(tags) + [777])
+
+    result = _extract()
+
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5, 777]
+    assert result.tags == [3, 5, 777]
+
+
 # the default path records its pass count too, so the gate can compare
 
 @respx.mock
