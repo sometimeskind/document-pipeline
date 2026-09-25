@@ -8,6 +8,7 @@ into Python, so they are what these tests pin down.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -21,6 +22,20 @@ DOC_ID = 42
 MARKER_ID = 9
 
 _LONG_CONTENT = "x" * enrich.MIN_CONTENT_CHARS
+
+
+@pytest.fixture(autouse=True)
+def results_path(tmp_path, monkeypatch):
+    """Every write path appends a pre-PATCH record (#1562) — keep it off /state."""
+    target = tmp_path / "results.jsonl"
+    monkeypatch.setenv("ENRICH_RESULTS_PATH", str(target))
+    return target
+
+
+def _records(path):
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def _client():
@@ -141,6 +156,89 @@ def test_suggested_tags_are_recorded_but_never_applied():
 
     assert result.suggested_tags == ["shipping", "hermes"]
     assert json.loads(patch.calls.last.request.content)["tags"] == [5, MARKER_ID]
+
+
+# --- the before-state record (#1562): what `rollback` replays ---
+
+@respx.mock
+def test_an_enriched_result_carries_the_before_and_after_state():
+    _mock_document(tags=(3,), title="scan_0042", correspondent=None)
+    _mock_suggestions(tags=(5,), correspondents=(8,))
+    respx.get(f"{PAPERLESS}/api/correspondents/8/").mock(
+        return_value=httpx.Response(200, json={"id": 8, "name": "Hermes"})
+    )
+    _mock_patch()
+
+    result = _enrich()
+
+    assert result.previous_title == "scan_0042"
+    assert result.previous_tags == [3]
+    assert result.previous_correspondent is None
+    # The after-state as ids, so rollback can tell whether anyone edited since.
+    assert result.tags == [3, 5, MARKER_ID]
+    assert result.correspondent_id == 8
+
+
+@respx.mock
+def test_a_marker_only_write_carries_the_before_state_too():
+    _mock_document(content="", tags=(3,), title="scan_0042", correspondent=4)
+    _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "skipped-short-content"
+    assert (result.previous_title, result.previous_tags, result.previous_correspondent) == (
+        "scan_0042", [3], 4,
+    )
+
+
+@respx.mock
+def test_the_record_is_written_before_the_patch(results_path):
+    """A crash mid-PATCH must leave evidence: the intent is on disk first."""
+    _mock_document(tags=(3,))
+    _mock_suggestions(tags=(5,))
+    seen_at_patch_time = []
+
+    def respond(request):
+        seen_at_patch_time.extend(_records(results_path))
+        return httpx.Response(200, json={"id": DOC_ID})
+
+    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(side_effect=respond)
+
+    _enrich()
+
+    assert len(seen_at_patch_time) == 1
+    record = seen_at_patch_time[0]
+    assert record["outcome"] == enrich.PENDING_OUTCOME
+    assert record["document_id"] == DOC_ID
+    assert record["previous_title"] == "scan_0042"
+    assert record["previous_tags"] == [3]
+    assert record["title"] == "Invoice from Hermes"
+    assert record["tags"] == [3, 5, MARKER_ID]
+
+
+@respx.mock
+def test_a_failed_patch_still_leaves_the_pending_record(results_path):
+    _mock_document(tags=(3,))
+    _mock_suggestions(tags=(5,))
+    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _enrich()
+
+    assert [r["outcome"] for r in _records(results_path)] == [enrich.PENDING_OUTCOME]
+
+
+@respx.mock
+def test_a_dry_run_writes_no_pending_record(results_path):
+    _mock_document(tags=(3,))
+    _mock_suggestions(tags=(5,))
+
+    _enrich(dry_run=True)
+
+    assert _records(results_path) == []
 
 
 # --- correspondents (#1363) ---
@@ -529,7 +627,11 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
 
     lines = target.read_text(encoding="utf-8").splitlines()
     assert [json.loads(line)["document_id"] for line in lines] == [DOC_ID, 43]
-    assert json.loads(lines[0]) == {
+    first = json.loads(lines[0])
+    # Stamped at write time, in UTC — what `rollback --since` filters on.
+    recorded_at = datetime.fromisoformat(first.pop("recorded_at"))
+    assert recorded_at.utcoffset() == timedelta(0)
+    assert first == {
         "document_id": DOC_ID,
         "outcome": "enriched",
         "title": "Invoice from Hermes",
@@ -537,6 +639,11 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
         "suggested_tags": ["shipping"],
         "correspondent": None,
         "duration_seconds": 1.5,
+        "previous_title": None,
+        "previous_tags": None,
+        "previous_correspondent": None,
+        "tags": None,
+        "correspondent_id": None,
     }
 
 
@@ -679,6 +786,17 @@ def test_rank_suggested_tags_survives_a_torn_final_line(tmp_path):
     assert enrich.rank_suggested_tags(str(target)) == (1, [("invoice", 1)])
 
 
+def test_rank_suggested_tags_ignores_the_pre_patch_record(tmp_path):
+    """The pending record repeats the final one; counting both would double every name."""
+    path = _write_results(tmp_path, [
+        {"document_id": 1, "outcome": enrich.PENDING_OUTCOME, "suggested_tags": ["tax"]},
+        {"document_id": 1, "outcome": "enriched", "suggested_tags": ["tax"]},
+        {"document_id": 2, "outcome": "enriched", "suggested_tags": ["tax"]},
+    ])
+
+    assert enrich.rank_suggested_tags(path) == (2, [("tax", 2)])
+
+
 
 # --- the correspondent backfill (#1373) ---
 
@@ -712,6 +830,31 @@ def test_backfill_patches_only_the_correspondent(monkeypatch):
     assert json.loads(patch.calls.last.request.content) == {"correspondent": 31}
     assert result.outcome == "backfilled"
     assert result.correspondent == "Cloudflare"
+
+
+@respx.mock
+def test_backfill_records_the_before_state_before_the_patch(monkeypatch, results_path):
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3, MARKER_ID), title="Curated by hand")
+    _mock_ollama("Cloudflare")
+    _mock_correspondent_search(results=({"id": 31},))
+    seen_at_patch_time = []
+
+    def respond(request):
+        seen_at_patch_time.extend(_records(results_path))
+        return httpx.Response(200, json={"id": DOC_ID})
+
+    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(side_effect=respond)
+
+    result = _backfill()
+
+    assert [r["outcome"] for r in seen_at_patch_time] == [enrich.PENDING_OUTCOME]
+    assert (result.previous_title, result.previous_tags, result.previous_correspondent) == (
+        "Curated by hand", [3, MARKER_ID], None,
+    )
+    # Title and tags untouched, so None — "this write did not set it".
+    assert (result.title, result.tags, result.correspondent_id) == (None, None, 31)
+    assert seen_at_patch_time[0]["correspondent_id"] == 31
 
 
 @respx.mock

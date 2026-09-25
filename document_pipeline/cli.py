@@ -36,8 +36,8 @@ _DEFAULT_PAPERLESS_HEALTH_CRON = "*/5 * * * *"
 def _print_vocab() -> None:
     """Frequency-ranked tag names the model proposed that matched nothing.
 
-    The one read-only subcommand this image has, because the data it reports on
-    lives on a PVC only this pod mounts. It is the #1280 harvesting step: tags
+    A subcommand (like `rollback`) because the data it reports on lives on a
+    PVC only this pod mounts. It is the #1280 harvesting step: tags
     cannot bootstrap themselves, so the vocabulary has to be created before
     matching can ever fire, and this is the only evidence of which names are
     worth creating.
@@ -57,9 +57,61 @@ def _print_vocab() -> None:
         print(f"{count:6d}  {name}")
 
 
+def _rollback(argv: list[str]) -> None:
+    """Replay the enrich before-state from the results JSONL (#1562).
+
+    Lives here for the same reason as `vocab`: the JSONL is on a PVC only this
+    pod mounts. Dry-run unless `--write`, like the rest of the pipeline.
+
+        kubectl exec -n mail deploy/document-pipeline -- \\
+            python -m document_pipeline rollback --since 2026-09-20T00:00:00Z
+    """
+    import argparse
+
+    from document_pipeline import enrich, rollback
+
+    parser = argparse.ArgumentParser(
+        prog="python -m document_pipeline rollback",
+        description="Revert enrich/backfill writes to the recorded before-state.",
+    )
+    parser.add_argument(
+        "--since", required=True, type=rollback.parse_since,
+        help="ISO date or timestamp (UTC if no offset); records before it are ignored",
+    )
+    parser.add_argument("--document", type=int, help="only this document id")
+    parser.add_argument("--write", action="store_true", help="apply; default is a dry run")
+    args = parser.parse_args(argv)
+
+    try:
+        records = rollback.load_latest(None, args.since, args.document)
+    except FileNotFoundError:
+        logger.error("No enrich results yet — nothing has run.")
+        sys.exit(1)
+
+    paperless_url = os.environ["PAPERLESS_URL"]
+    # Same superuser-first rule as flow._paperless_admin_token, inlined so this
+    # subcommand does not import Prefect.
+    token = os.environ.get("PAPERLESS_ADMIN_TOKEN") or os.environ["PAPERLESS_API_TOKEN"]
+    with enrich.open_client(token) as client:
+        reversions = rollback.run(client, paperless_url, records, write=args.write)
+
+    for r in reversions:
+        print(f"{r.document_id:8d}  {r.status:16s}  {r.detail}")
+    counts: dict[str, int] = {}
+    for r in reversions:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    summary = ", ".join(f"{n} {status}" for status, n in sorted(counts.items())) or "nothing to do"
+    print(f"{len(reversions)} document(s): {summary}")
+    if not args.write and counts.get("would-revert"):
+        print("DRY RUN — nothing was written. Re-run with --write to apply.")
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "vocab":
         _print_vocab()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "rollback":
+        _rollback(sys.argv[2:])
         return
 
     missing = [v for v in _REQUIRED if not os.environ.get(v)]
