@@ -43,10 +43,13 @@ MAX_CORRESPONDENT_CHARS = 128  # documents.models.Correspondent.name max_length
 # machine-generated title looks like.
 CONSUME_TITLE_CHARS = 127
 
-# Applied to every document this module touches. `find_unenriched` queries on its
-# absence, so it is both the sweep's resume marker and the guard that makes a
-# replayed trigger cheap.
-MARKER_TAG = "ai-processed"
+# Put on every new document by a paperless Workflow (trigger Document Added,
+# action assign tag — a DB object, recorded in the homelab repo's docs), and
+# removed by every terminal outcome here (#1561). `find_unenriched` queries on its
+# PRESENCE, so the tag marks the small set still waiting rather than the whole
+# library, and a failed run leaves it in place for the next sweep. The trigger
+# path never requires it: a document that dodged the workflow is still enriched.
+QUEUE_TAG = "queue"
 
 # The correspondent backfill's terminal marker (#1373): applied when the model
 # finds no clear issuer, or there is no OCR text to ask about. Without it every
@@ -142,7 +145,7 @@ def patch_document(
     """Write back whichever of tags, title and correspondent we have to write.
 
     Omitting `title` is what keeps the short-content path from rewriting a title
-    it never generated — it still gets the marker so the sweep stops picking it.
+    it never generated — it still loses `queue` so the sweep stops picking it.
     Same rule for `correspondent`: None means "leave whatever is there alone",
     never "clear it". And for `tags`, which the correspondent backfill omits so
     that a PATCH assigning only a correspondent cannot touch the tag list.
@@ -172,25 +175,25 @@ def normalize_title(raw: str | None) -> str:
     return " ".join((raw or "").split())[:MAX_TITLE_CHARS]
 
 
-def converged_tags(tags: list[int], marker_id: int) -> list[int]:
-    """`tags` with the sweep's convergence marker applied.
+def converged_tags(tags: list[int], queue_id: int) -> list[int]:
+    """`tags` marked "done, don't pick it again": the `queue` tag removed.
 
-    The one place that decides what "done, don't pick it again" looks like on
-    a tag list; `rollback` goes through it to leave a reverted document
-    converged. When the marker becomes a `queue` tag whose ABSENCE means done
-    (#1561), this is what flips.
+    The one place that decides what convergence looks like on a tag list; every
+    terminal outcome goes through it, and so does `rollback`, to leave a
+    reverted document converged. Applied last, so it also wins over a model
+    that matched `queue` itself as a tag.
     """
-    return sorted({int(t) for t in tags} | {int(marker_id)})
+    return sorted({int(t) for t in tags} - {int(queue_id)})
 
 
-def merge_tags(existing: list[int], matched: list[int], marker_id: int) -> list[int]:
-    """Union of the tags already on the document, the matched ones, and the marker.
+def merge_tags(existing: list[int], added: list[int]) -> list[int]:
+    """Union of the tags already on the document and the ones being added.
 
     PATCHing `tags` REPLACES the list, so the document's existing tags must be
     merged back in — otherwise enrichment silently strips the `scanner` tag the
     scan flow applies at ingest.
     """
-    return sorted({int(t) for t in existing} | {int(t) for t in matched} | {int(marker_id)})
+    return sorted({int(t) for t in existing} | {int(t) for t in added})
 
 
 def pick_correspondent(suggestions: dict) -> tuple[int | None, str | None]:
@@ -402,13 +405,13 @@ def extract_title(content: str) -> str | None:
 
 
 def find_unenriched(
-    client: httpx.Client, paperless_url: str, marker_id: int, limit: int
+    client: httpx.Client, paperless_url: str, queue_id: int, limit: int
 ) -> list[int]:
-    """Ids of documents that have never been enriched, oldest first."""
+    """Ids of documents still carrying `queue`, oldest first."""
     resp = client.get(
         f"{paperless_url}/api/documents/",
         params={
-            "tags__id__none": marker_id,
+            "tags__id__all": queue_id,
             "page_size": limit,
             "ordering": "id",
             "fields": "id",
@@ -419,19 +422,18 @@ def find_unenriched(
 
 
 def find_without_correspondent(
-    client: httpx.Client, paperless_url: str, marker_id: int, declined_id: int, limit: int
+    client: httpx.Client, paperless_url: str, queue_id: int, declined_id: int, limit: int
 ) -> list[int]:
     """Ids of enriched documents with no correspondent and no decline marker, oldest first.
 
-    Enriched only (`ai-processed`): everything still unenriched gets its
-    correspondent inline from the sweep as it reaches it, so touching it here
-    would do that query twice.
+    Enriched only (no `queue`): everything still queued gets its correspondent
+    inline from the sweep as it reaches it, so touching it here would do that
+    query twice. `tags__id__none` takes a comma list and excludes each id.
     """
     resp = client.get(
         f"{paperless_url}/api/documents/",
         params={
-            "tags__id__all": marker_id,
-            "tags__id__none": declined_id,
+            "tags__id__none": f"{queue_id},{declined_id}",
             "correspondent__isnull": "true",
             "page_size": limit,
             "ordering": "id",
@@ -452,11 +454,12 @@ def has_curated_title(document: dict) -> bool:
     workflow or an earlier enrichment run wrote that title.
 
     A freshly consumed document always compares equal, so this never fires on the
-    post-consume trigger path — it only ever bites on the sweep.
+    first post-consume trigger — it bites on the sweep, and on a replayed
+    trigger for a document already enriched, which it turns into a cheap no-op.
 
     A document with no `original_file_name` cannot be tested at all. Those are
     treated as un-curated and enriched, deliberately: the alternative is marking
-    them processed and silently never titling them, and the contract is that this
+    them done and silently never titling them, and the contract is that this
     must never cost a document its title.
     """
     original = document.get("original_file_name")
@@ -469,40 +472,36 @@ def enrich_document(
     client: httpx.Client,
     paperless_url: str,
     document_id: int,
-    marker_id: int,
+    queue_id: int,
     *,
     dry_run: bool = False,
 ) -> EnrichResult:
     """Retitle and tag one document. Raises on any Paperless or LLM failure.
 
+    Does NOT require `queue` on the document (#1561): the trigger path enriches
+    whatever it is handed — a UI upload can dodge the workflow — and strips the
+    tag if it is there. A replayed trigger is still cheap: the enriched title no
+    longer equals the filename stem, so it lands in the curated-title skip.
+
     `dry_run` reports what would be written without writing anything: no PATCH,
-    so no marker, no filename rename and no state change of any kind. That also
-    makes it non-resuming — it re-reports the same documents every time — which
-    is exactly what makes a sample reviewable before the live pass.
+    so `queue` stays, no filename rename and no state change of any kind. That
+    also makes it non-resuming — it re-reports the same documents every time —
+    which is exactly what makes a sample reviewable before the live pass.
     """
     started = time.perf_counter()
 
     document = fetch_document(client, paperless_url, document_id)
     existing_tags = [int(t) for t in document.get("tags") or []]
-    if marker_id in existing_tags:
-        logger.info("Document %s already enriched, skipping", document_id)
-        return EnrichResult(
-            document_id=document_id,
-            outcome="already-enriched",
-            duration_seconds=time.perf_counter() - started,
-        )
 
     if has_curated_title(document):
-        # Marked anyway, so the sweep converges instead of re-reading this
+        # Converged anyway, so the sweep stops instead of re-reading this
         # document every hour for the rest of the library's life.
         logger.info(
             "Document %s has a curated title %r — leaving it alone",
             document_id, document.get("title"),
         )
         if not dry_run:
-            patch_document(
-                client, paperless_url, document_id, merge_tags(existing_tags, [], marker_id)
-            )
+            _converge(client, paperless_url, document_id, existing_tags, queue_id)
         return EnrichResult(
             document_id=document_id,
             outcome="skipped-curated-title",
@@ -512,16 +511,14 @@ def enrich_document(
 
     content_length = len((document.get("content") or "").strip())
     if content_length < MIN_CONTENT_CHARS:
-        # Not a failure: an empty scan has nothing to title from. Marked anyway,
-        # so the sweep does not keep re-picking it forever.
+        # Not a failure: an empty scan has nothing to title from. Converged
+        # anyway, so the sweep does not keep re-picking it forever.
         logger.info(
             "Document %s has only %d chars of OCR content (min %d) — leaving title unchanged",
             document_id, content_length, MIN_CONTENT_CHARS,
         )
         if not dry_run:
-            patch_document(
-                client, paperless_url, document_id, merge_tags(existing_tags, [], marker_id)
-            )
+            _converge(client, paperless_url, document_id, existing_tags, queue_id)
         return EnrichResult(
             document_id=document_id,
             outcome="skipped-short-content",
@@ -584,7 +581,7 @@ def enrich_document(
             **previous_state(document),
         )
 
-    tags = merge_tags(existing_tags, matched_tags, marker_id)
+    tags = converged_tags(merge_tags(existing_tags, matched_tags), queue_id)
     result = EnrichResult(
         document_id=document_id,
         outcome="enriched",
@@ -608,6 +605,21 @@ def enrich_document(
     )
     result.duration_seconds = time.perf_counter() - started
     return result
+
+
+def _converge(
+    client: httpx.Client, paperless_url: str, document_id: int,
+    existing_tags: list[int], queue_id: int,
+) -> None:
+    """A tags-only PATCH that strips `queue` — skipped when it is not there.
+
+    Skipping matters on the trigger path, which no longer requires the tag: a
+    replayed trigger for a converged document must stay a no-op, not a save that
+    re-renders the filename for nothing.
+    """
+    tags = converged_tags(existing_tags, queue_id)
+    if tags != sorted(set(existing_tags)):
+        patch_document(client, paperless_url, document_id, tags)
 
 
 def backfill_correspondent(
@@ -647,8 +659,8 @@ def backfill_correspondent(
     content = document.get("content") or ""
     content_length = len(content.strip())
     if content_length < MIN_CONTENT_CHARS:
-        # The sweep marks these `ai-processed` without titling them, so they
-        # land in this query too. Nothing to ask about — mark, don't query.
+        # The sweep converges these without titling them, so they land in
+        # this query too. Nothing to ask about — mark, don't query.
         logger.info(
             "Document %s has only %d chars of OCR content (min %d) — no correspondent",
             document_id, content_length, MIN_CONTENT_CHARS,
@@ -662,7 +674,7 @@ def backfill_correspondent(
     if name is None:
         if not dry_run:
             patch_document(
-                client, paperless_url, document_id, merge_tags(existing_tags, [], declined_id)
+                client, paperless_url, document_id, merge_tags(existing_tags, [declined_id])
             )
         logger.info("Document %s: no correspondent found%s", document_id,
                     " (DRY RUN)" if dry_run else f" — tagged {NO_CORRESPONDENT_TAG!r}")
@@ -698,8 +710,29 @@ def backfill_correspondent(
     return result
 
 
-def resolve_marker_tag(client: httpx.Client, paperless_url: str) -> int:
-    return resolve_tag(client, paperless_url, MARKER_TAG)
+def resolve_queue_tag(client: httpx.Client, paperless_url: str) -> int:
+    """The `queue` tag's id, created with matching off and no owner if missing.
+
+    Normally the operator creates it with the Workflow that assigns it. Created
+    here only so an image that lands first does not fail; matching None rather
+    than the UI's Automatic default, because an auto tag trains the classifier,
+    which would then guess `queue` onto documents on its own. Unowned for the
+    same reason as every object this pipeline creates (#1292).
+    """
+    resp = client.get(f"{paperless_url}/api/tags/", params={"name__iexact": QUEUE_TAG})
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if results:
+        return int(results[0]["id"])
+
+    resp = client.post(
+        f"{paperless_url}/api/tags/",
+        json={"name": QUEUE_TAG, "matching_algorithm": 0, "owner": None},
+    )
+    resp.raise_for_status()
+    tag_id = int(resp.json()["id"])
+    logger.info("Created Paperless tag %r (id %s)", QUEUE_TAG, tag_id)
+    return tag_id
 
 
 def resolve_declined_tag(client: httpx.Client, paperless_url: str) -> int:

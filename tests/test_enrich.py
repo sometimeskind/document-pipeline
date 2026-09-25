@@ -19,7 +19,7 @@ from document_pipeline import enrich
 
 PAPERLESS = "http://paperless"
 DOC_ID = 42
-MARKER_ID = 9
+QUEUE_ID = 9
 
 _LONG_CONTENT = "x" * enrich.MIN_CONTENT_CHARS
 
@@ -100,22 +100,28 @@ def _mock_patch():
 
 def _enrich(*, dry_run=False):
     with _client() as client:
-        return enrich.enrich_document(client, PAPERLESS, DOC_ID, MARKER_ID, dry_run=dry_run)
+        return enrich.enrich_document(client, PAPERLESS, DOC_ID, QUEUE_ID, dry_run=dry_run)
 
 
 # --- merge_tags: the union that keeps a PATCH from destroying existing tags ---
 
-def test_merge_tags_unions_existing_matched_and_marker():
-    assert enrich.merge_tags([3, 1], [5, 3], MARKER_ID) == [1, 3, 5, MARKER_ID]
+def test_merge_tags_unions_existing_and_added():
+    assert enrich.merge_tags([3, 1], [5, 3]) == [1, 3, 5]
 
 
 def test_merge_tags_keeps_existing_tags_when_the_llm_matches_none():
     """PATCHing tags REPLACES the list — the scan flow's `scanner` tag must survive."""
-    assert enrich.merge_tags([7], [], MARKER_ID) == [7, MARKER_ID]
+    assert enrich.merge_tags([7], []) == [7]
 
 
-def test_merge_tags_is_idempotent_when_the_marker_is_already_present():
-    assert enrich.merge_tags([MARKER_ID, 7], [7], MARKER_ID) == [7, MARKER_ID]
+# --- converged_tags: the one place "done" is applied to a tag list (#1561) ---
+
+def test_converged_tags_removes_the_queue_tag():
+    assert enrich.converged_tags([QUEUE_ID, 7, 3], QUEUE_ID) == [3, 7]
+
+
+def test_converged_tags_is_idempotent_when_queue_is_absent():
+    assert enrich.converged_tags([7, 3], QUEUE_ID) == [3, 7]
 
 
 # --- title normalisation ---
@@ -131,8 +137,8 @@ def test_normalize_title_truncates_to_the_column_width():
 # --- enrich_document ---
 
 @respx.mock
-def test_patch_payload_carries_the_title_and_the_unioned_tags():
-    _mock_document(tags=(3,))
+def test_patch_payload_carries_the_title_and_the_unioned_tags_without_queue():
+    _mock_document(tags=(3, QUEUE_ID))
     _mock_suggestions(tags=(5,))
     patch = _mock_patch()
 
@@ -140,9 +146,35 @@ def test_patch_payload_carries_the_title_and_the_unioned_tags():
 
     assert result.outcome == "enriched"
     assert json.loads(patch.calls.last.request.content) == {
-        "tags": [3, 5, MARKER_ID],
+        "tags": [3, 5],
         "title": "Invoice from Hermes",
     }
+
+
+@respx.mock
+def test_the_trigger_path_enriches_a_document_that_never_got_queue():
+    """A UI upload can dodge the workflow; the trigger must not require the tag."""
+    _mock_document(tags=(3,))
+    suggestions = _mock_suggestions(tags=(5,))
+    patch = _mock_patch()
+
+    result = _enrich()
+
+    assert result.outcome == "enriched"
+    assert suggestions.called
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
+
+
+@respx.mock
+def test_queue_matched_by_the_model_is_still_stripped():
+    """Convergence is applied last, so it wins over the matched tags."""
+    _mock_document(tags=(3, QUEUE_ID))
+    _mock_suggestions(tags=(5, QUEUE_ID))
+    patch = _mock_patch()
+
+    _enrich()
+
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
 
 
 @respx.mock
@@ -155,14 +187,14 @@ def test_suggested_tags_are_recorded_but_never_applied():
     result = _enrich()
 
     assert result.suggested_tags == ["shipping", "hermes"]
-    assert json.loads(patch.calls.last.request.content)["tags"] == [5, MARKER_ID]
+    assert json.loads(patch.calls.last.request.content)["tags"] == [5]
 
 
 # --- the before-state record (#1562): what `rollback` replays ---
 
 @respx.mock
 def test_an_enriched_result_carries_the_before_and_after_state():
-    _mock_document(tags=(3,), title="scan_0042", correspondent=None)
+    _mock_document(tags=(3, QUEUE_ID), title="scan_0042", correspondent=None)
     _mock_suggestions(tags=(5,), correspondents=(8,))
     respx.get(f"{PAPERLESS}/api/correspondents/8/").mock(
         return_value=httpx.Response(200, json={"id": 8, "name": "Hermes"})
@@ -172,15 +204,15 @@ def test_an_enriched_result_carries_the_before_and_after_state():
     result = _enrich()
 
     assert result.previous_title == "scan_0042"
-    assert result.previous_tags == [3]
+    assert result.previous_tags == [3, QUEUE_ID]
     assert result.previous_correspondent is None
     # The after-state as ids, so rollback can tell whether anyone edited since.
-    assert result.tags == [3, 5, MARKER_ID]
+    assert result.tags == [3, 5]
     assert result.correspondent_id == 8
 
 
 @respx.mock
-def test_a_marker_only_write_carries_the_before_state_too():
+def test_a_tags_only_write_carries_the_before_state_too():
     _mock_document(content="", tags=(3,), title="scan_0042", correspondent=4)
     _mock_patch()
 
@@ -214,7 +246,7 @@ def test_the_record_is_written_before_the_patch(results_path):
     assert record["previous_title"] == "scan_0042"
     assert record["previous_tags"] == [3]
     assert record["title"] == "Invoice from Hermes"
-    assert record["tags"] == [3, 5, MARKER_ID]
+    assert record["tags"] == [3, 5]
 
 
 @respx.mock
@@ -533,10 +565,10 @@ def test_dry_run_reports_the_correspondent_without_creating_it():
 
 
 @respx.mock
-def test_short_content_skips_the_llm_and_only_marks_the_document():
+def test_short_content_skips_the_llm_and_only_strips_queue():
     """Schema-constrained generation always emits a title, so a blank scan would
-    get an invented one. Skip it, but mark it so the sweep stops re-picking it."""
-    _mock_document(content="too short")
+    get an invented one. Skip it, but converge it so the sweep stops re-picking it."""
+    _mock_document(content="too short", tags=(3, QUEUE_ID))
     suggestions = _mock_suggestions()
     patch = _mock_patch()
 
@@ -545,7 +577,17 @@ def test_short_content_skips_the_llm_and_only_marks_the_document():
     assert result.outcome == "skipped-short-content"
     assert result.title is None
     assert not suggestions.called
-    assert json.loads(patch.calls.last.request.content) == {"tags": [3, MARKER_ID]}
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3]}
+
+
+@respx.mock
+def test_short_content_without_queue_writes_nothing():
+    """Nothing to converge, so no PATCH — and no pointless filename re-render."""
+    _mock_document(content="too short", tags=(3,))
+    patch = _mock_patch()
+
+    assert _enrich().outcome == "skipped-short-content"
+    assert not patch.called
 
 
 @respx.mock
@@ -561,15 +603,16 @@ def test_empty_llm_title_raises_rather_than_patching():
 
 
 @respx.mock
-def test_an_already_marked_document_is_a_cheap_no_op():
-    """The guard that makes a replayed trigger free."""
-    _mock_document(tags=(3, MARKER_ID))
+def test_a_replayed_trigger_on_an_enriched_document_is_a_cheap_no_op():
+    """No `queue` and an enriched title: the curated-title check makes it free —
+    no LLM call and no write."""
+    _mock_document(tags=(3,), title="Invoice from Hermes")
     suggestions = _mock_suggestions()
     patch = _mock_patch()
 
     result = _enrich()
 
-    assert result.outcome == "already-enriched"
+    assert result.outcome == "skipped-curated-title"
     assert not suggestions.called
     assert not patch.called
 
@@ -592,16 +635,17 @@ def test_a_suggestions_failure_propagates_so_prefect_can_retry():
 # --- find_unenriched ---
 
 @respx.mock
-def test_find_unenriched_queries_on_the_absence_of_the_marker():
+def test_find_unenriched_queries_on_the_presence_of_queue():
     route = respx.get(f"{PAPERLESS}/api/documents/").mock(
         return_value=httpx.Response(200, json={"results": [{"id": 1}, {"id": 2}]})
     )
 
     with _client() as client:
-        assert enrich.find_unenriched(client, PAPERLESS, MARKER_ID, 20) == [1, 2]
+        assert enrich.find_unenriched(client, PAPERLESS, QUEUE_ID, 20) == [1, 2]
 
     params = route.calls.last.request.url.params
-    assert params["tags__id__none"] == str(MARKER_ID)
+    assert params["tags__id__all"] == str(QUEUE_ID)
+    assert "tags__id__none" not in params
     assert params["page_size"] == "20"
     assert params["ordering"] == "id"
 
@@ -685,8 +729,8 @@ def test_a_document_with_no_original_filename_is_enriched_rather_than_skipped():
 
 
 @respx.mock
-def test_a_curated_title_is_marked_but_never_retitled():
-    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf", tags=(3,))
+def test_a_curated_title_is_converged_but_never_retitled():
+    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf", tags=(3, QUEUE_ID))
     suggestions = _mock_suggestions()
     patch = _mock_patch()
 
@@ -694,8 +738,8 @@ def test_a_curated_title_is_marked_but_never_retitled():
 
     assert result.outcome == "skipped-curated-title"
     assert not suggestions.called  # costs no LLM call at all
-    # Marked, so the sweep converges instead of re-reading it every hour forever.
-    assert json.loads(patch.calls.last.request.content) == {"tags": [3, MARKER_ID]}
+    # Converged, so the sweep stops instead of re-reading it every hour forever.
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3]}
 
 
 # --- dry run: the review pass that must not be able to write ---
@@ -716,9 +760,9 @@ def test_dry_run_reports_the_title_without_patching_anything():
 
 
 @respx.mock
-def test_dry_run_does_not_mark_a_curated_document():
-    """No marker means no rename and no state change — a dry run is repeatable."""
-    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf")
+def test_dry_run_does_not_converge_a_curated_document():
+    """`queue` stays, no rename and no state change — a dry run is repeatable."""
+    _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf", tags=(3, QUEUE_ID))
     patch = _mock_patch()
 
     assert _enrich(dry_run=True).outcome == "skipped-curated-title"
@@ -726,8 +770,8 @@ def test_dry_run_does_not_mark_a_curated_document():
 
 
 @respx.mock
-def test_dry_run_does_not_mark_a_short_content_document():
-    _mock_document(content="too short")
+def test_dry_run_does_not_converge_a_short_content_document():
+    _mock_document(content="too short", tags=(3, QUEUE_ID))
     patch = _mock_patch()
 
     assert _enrich(dry_run=True).outcome == "skipped-short-content"
@@ -816,7 +860,7 @@ def test_backfill_patches_only_the_correspondent(monkeypatch):
     leave both byte-identical. And no ai_suggestions call at all — the paperless
     pass is known-dry, and respx would raise on the unmocked route."""
     _fallback_env(monkeypatch)
-    _mock_document(tags=(3, MARKER_ID), title="Curated by hand")
+    _mock_document(tags=(3,), title="Curated by hand")
     ollama = _mock_ollama("Cloudflare")
     _mock_correspondent_search(results=())
     create = _mock_correspondent_create(correspondent_id=31)
@@ -835,7 +879,7 @@ def test_backfill_patches_only_the_correspondent(monkeypatch):
 @respx.mock
 def test_backfill_records_the_before_state_before_the_patch(monkeypatch, results_path):
     _fallback_env(monkeypatch)
-    _mock_document(tags=(3, MARKER_ID), title="Curated by hand")
+    _mock_document(tags=(3,), title="Curated by hand")
     _mock_ollama("Cloudflare")
     _mock_correspondent_search(results=({"id": 31},))
     seen_at_patch_time = []
@@ -850,7 +894,7 @@ def test_backfill_records_the_before_state_before_the_patch(monkeypatch, results
 
     assert [r["outcome"] for r in seen_at_patch_time] == [enrich.PENDING_OUTCOME]
     assert (result.previous_title, result.previous_tags, result.previous_correspondent) == (
-        "Curated by hand", [3, MARKER_ID], None,
+        "Curated by hand", [3], None,
     )
     # Title and tags untouched, so None — "this write did not set it".
     assert (result.title, result.tags, result.correspondent_id) == (None, None, 31)
@@ -860,7 +904,7 @@ def test_backfill_records_the_before_state_before_the_patch(monkeypatch, results
 @respx.mock
 def test_backfill_reuses_an_existing_correspondent(monkeypatch):
     _fallback_env(monkeypatch)
-    _mock_document(tags=(3, MARKER_ID))
+    _mock_document(tags=(3,))
     _mock_ollama("symbox")
     _mock_correspondent_search(results=({"id": 21, "name": "Symbox"},))
     patch = _mock_patch()
@@ -875,30 +919,30 @@ def test_backfill_marks_a_declined_document_so_it_is_never_re_queried(monkeypatc
     """The terminal marker: without it the document matches correspondent__isnull
     again next hour, forever. Existing tags are merged back in, nothing else moves."""
     _fallback_env(monkeypatch)
-    _mock_document(tags=(3, MARKER_ID))
+    _mock_document(tags=(3,))
     _mock_ollama("")
     patch = _mock_patch()
 
     result = _backfill()
 
-    assert json.loads(patch.calls.last.request.content) == {"tags": [3, MARKER_ID, DECLINED_ID]}
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3, DECLINED_ID]}
     assert result.outcome == "declined"
     assert result.correspondent is None
 
 
 @respx.mock
 def test_backfill_marks_an_ocr_floor_document_without_asking(monkeypatch):
-    """The sweep marks sub-floor documents `ai-processed` untitled, so they land
+    """The sweep converges sub-floor documents untitled, so they land
     in this query too. There is nothing to ask about; mark them, don't query."""
     _fallback_env(monkeypatch)
-    _mock_document(content="", tags=(MARKER_ID,))
+    _mock_document(content="", tags=(7,))
     ollama = _mock_ollama()
     patch = _mock_patch()
 
     result = _backfill()
 
     assert not ollama.called
-    assert json.loads(patch.calls.last.request.content) == {"tags": [MARKER_ID, DECLINED_ID]}
+    assert json.loads(patch.calls.last.request.content) == {"tags": [7, DECLINED_ID]}
     assert result.outcome == "skipped-short-content"
 
 
@@ -908,7 +952,7 @@ def test_backfill_raises_on_an_ollama_failure_rather_than_marking(monkeypatch):
     timeout marked `no-correspondent` is lost to the backfill for good. Raise,
     write nothing, let Prefect retry."""
     _fallback_env(monkeypatch)
-    _mock_document(tags=(MARKER_ID,))
+    _mock_document(tags=(7,))
     respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
     patch = _mock_patch()
 
@@ -923,7 +967,7 @@ def test_backfill_raises_when_unconfigured(monkeypatch):
     """Unlike the fallback, off cannot mean "decline everything"."""
     monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
     monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
-    _mock_document(tags=(MARKER_ID,))
+    _mock_document(tags=(7,))
     patch = _mock_patch()
 
     with pytest.raises(RuntimeError):
@@ -936,7 +980,7 @@ def test_backfill_raises_when_unconfigured(monkeypatch):
 def test_backfill_leaves_a_document_that_gained_a_correspondent_alone(monkeypatch):
     """The sweep or a hand edit can get there between the query and the fetch."""
     _fallback_env(monkeypatch)
-    _mock_document(tags=(MARKER_ID,), correspondent=4)
+    _mock_document(tags=(7,), correspondent=4)
     ollama = _mock_ollama()
     patch = _mock_patch()
 
@@ -951,7 +995,7 @@ def test_backfill_leaves_a_document_that_gained_a_correspondent_alone(monkeypatc
 def test_backfill_dry_run_reports_without_creating_or_patching(monkeypatch):
     """No search, no POST, no PATCH — respx would raise on any of them."""
     _fallback_env(monkeypatch)
-    _mock_document(tags=(MARKER_ID,))
+    _mock_document(tags=(7,))
     _mock_ollama("Cloudflare")
 
     result = _backfill(dry_run=True)
@@ -963,7 +1007,7 @@ def test_backfill_dry_run_reports_without_creating_or_patching(monkeypatch):
 @respx.mock
 def test_backfill_dry_run_does_not_mark_a_declined_document(monkeypatch):
     _fallback_env(monkeypatch)
-    _mock_document(tags=(MARKER_ID,))
+    _mock_document(tags=(7,))
     _mock_ollama("")
     patch = _mock_patch()
 
@@ -981,12 +1025,13 @@ def test_find_without_correspondent_queries_enriched_unmarked_documents():
 
     with _client() as client:
         assert enrich.find_without_correspondent(
-            client, PAPERLESS, MARKER_ID, DECLINED_ID, 8
+            client, PAPERLESS, QUEUE_ID, DECLINED_ID, 8
         ) == [1, 2]
 
     params = route.calls.last.request.url.params
-    assert params["tags__id__all"] == str(MARKER_ID)
-    assert params["tags__id__none"] == str(DECLINED_ID)
+    # Enriched = no `queue` (#1561); paperless excludes each id in the list.
+    assert "tags__id__all" not in params
+    assert params["tags__id__none"] == f"{QUEUE_ID},{DECLINED_ID}"
     assert params["correspondent__isnull"] == "true"
     assert params["page_size"] == "8"
     assert params["ordering"] == "id"

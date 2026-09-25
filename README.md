@@ -173,8 +173,21 @@ staleness alert open forever.
 Paperless 3.0 ships LLM suggestions but only behind the manual "Suggest" button —
 nothing runs during consumption. The `enrich` flow is that missing automation: it
 reads the document, asks Paperless for an `ai_suggestions` title and tag matches,
-and writes back the title plus the **union** of the document's existing tags, the
-matched tags, and an `ai-processed` marker.
+and writes back the title plus the **union** of the document's existing tags and
+the matched tags — minus the `queue` tag.
+
+**`queue` marks the documents still waiting** (homelab#1561). A paperless Workflow
+(trigger *Document Added*, action *assign tag* `queue`) puts it on every new
+document; every terminal outcome here (enriched, skipped-curated-title,
+skipped-short-content) removes it; a failed run leaves it for the next sweep. The
+workflow is a paperless DB object, so its shape is recorded in the homelab repo
+(`docs/scan-ingest-runbook.md`) rather than here. `enrich.converged_tags` is the
+one place that decision is applied to a tag list. The trigger path never
+*requires* the tag — a document that dodged the workflow is enriched anyway — and a
+replayed trigger stays cheap because an enriched title no longer equals the
+filename stem (see the curated-title rule below), so it costs no LLM call and no
+write. If `queue` does not exist yet the pipeline creates it with matching *None*
+and no owner.
 
 It is post-consume by necessity: `ai_suggestions` reads `document.content`, which
 does not exist until Paperless has done the OCR. Paperless's consume is an
@@ -193,7 +206,7 @@ Two details are load-bearing:
   flows drain a source wholesale so a skipped run is covered by the next one, but
   a skipped enrich run silently loses that document.
 
-`enrich-sweep` enriches documents that carry no marker. It covers a dropped
+`enrich-sweep` enriches documents that still carry `queue`. It covers a dropped
 trigger, and run on a cron it is also the backfill over a pre-existing library —
 the same code path, repeated, rather than a separate one-off script. Its own
 `concurrency("enrich-sweep", occupy=1)` slot stops a long batch from overlapping
@@ -204,20 +217,20 @@ Two things exist for the backfill specifically:
 - **A document whose title is not `Path(original_file_name).stem[:127]` is never
   retitled.** That is precisely what paperless's consumer writes at consume time,
   so inequality is an exact test for "a human or a workflow named this" rather
-  than a guess. Such documents still get the marker, so the sweep converges. A
+  than a guess. Such documents still lose `queue`, so the sweep converges. A
   freshly consumed document always compares equal, so this never fires on the
-  trigger path.
-- **`dry_run=true` writes nothing** — no PATCH, so no marker, no filename rename
-  and no state change. It reports the proposed title and the unmatched names to
-  the results JSONL for review. Because it leaves no marker it re-reads the same
+  first trigger for a document.
+- **`dry_run=true` writes nothing** — no PATCH, so `queue` stays, no filename
+  rename and no state change. It reports the proposed title and the unmatched names
+  to the results JSONL for review. Because `queue` stays it re-reads the same
   documents every time: it is a sample, not a pass over the library. It is a
   flow-run parameter, not an env var, deliberately — the sweep's steady-state job
   is catching dropped triggers, and a dry-run default would silently disable it.
 
 ### Correspondent backfill
 
-`correspondent-backfill` covers the complementary set: documents that already
-carry the `ai-processed` marker but have no correspondent — everything enriched
+`correspondent-backfill` covers the complementary set: documents that no longer
+carry `queue` but have no correspondent — everything enriched
 before the dedicated correspondent query existed, plus every document that query
 has since declined (~15–25% of the sweep's output: forms and certificates with no
 obvious issuer). It skips `ai_suggestions` entirely and runs only the
@@ -286,10 +299,15 @@ library:
   fields that differ. If its title, tags or correspondent no longer match what the
   record wrote, replaying the before-state would destroy that edit. A `pending`
   record whose PATCH never landed is skipped the same way.
-- **A reverted document is left converged.** It keeps the `ai-processed` marker
-  (applied through `enrich.converged_tags`) so the sweep does not redo it, and a
-  correspondent reverted to none also gets `no-correspondent` so the backfill
-  does not reassign it.
+- **A reverted document is left converged.** It is left without `queue` (applied
+  through `enrich.converged_tags`, so a before-state that carried it is not
+  replayed verbatim) and the sweep does not redo it, and a correspondent reverted
+  to none also gets `no-correspondent` so the backfill does not reassign it.
+- **Deleted tags are dropped, not reintroduced.** Records written before #1561
+  name the retired `ai-processed` tag's id in their before- and after-state. Ids
+  that no longer exist in paperless are left out of both the comparison and the
+  PATCH (which would otherwise 400) and listed in the output as
+  `dropped deleted tag id(s) [...]`.
 - **A dry run creates nothing**, not even a missing `no-correspondent` tag.
 
 `--write` appends a `rolled-back` record (itself carrying the before-state), and a
@@ -297,6 +315,33 @@ second run reports `already-reverted`. Created correspondents are left in place 
 they are unowned and harmless — and the file rename undoes itself: paperless
 re-renders the filename on the PATCH. Records from before this existed carry no
 `recorded_at` or before-state and are never matched.
+
+### Migrating from `ai-processed` (homelab#1561, one-off)
+
+Before #1561 convergence was an `ai-processed` marker on every enriched document
+and the sweep queried on its absence. Moving to `queue` needs one pass that gives
+`queue` to every document *without* the marker, in this order so no sweep ever runs
+against a half-migrated library:
+
+1. **Deploy the image that queries on `queue`, and create the Workflow.** Until
+   step 2 the sweep finds nothing, and the backfill may reach an unmigrated
+   document early (harmless: it only assigns a correspondent). The Workflow's
+   timing does not matter — the trigger path does not need the tag.
+2. **Queue the unmarked documents** — dry-run by default, idempotent:
+
+   ```bash
+   kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline migrate-queue
+   kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline migrate-queue --write
+   ```
+
+   It `bulk_edit`s `add_tag` onto every document matching
+   `tags__id__none=<ai-processed>,<queue>`, creating `queue` (matching *None*,
+   unowned) if the operator has not yet.
+3. **Delete the `ai-processed` tag** in the paperless UI. Safe for filenames:
+   `PAPERLESS_FILENAME_FORMAT` contains no tags, so no rename storm. Rollback copes
+   with the deleted id in older records (above).
+
+`queue_migration.py` and the `migrate-queue` subcommand can go once this has run.
 
 ## Paperless task-queue health (`paperless-health` flow)
 

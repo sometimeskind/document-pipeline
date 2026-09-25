@@ -18,8 +18,11 @@ from document_pipeline import enrich, rollback
 
 
 PAPERLESS = "http://paperless"
-MARKER_ID = 9
+QUEUE_ID = 9
 DECLINED_ID = 11
+# The retired `ai-processed` marker (#1561): named by every record written
+# before the queue tag, and deleted from paperless by the migration.
+DELETED_MARKER_ID = 99
 SINCE = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 
@@ -28,7 +31,7 @@ def _client():
 
 
 def _record(document_id=42, outcome="enriched", recorded_at="2026-09-10T12:00:00+00:00", **kw):
-    """An enriched record: consumer title + tag 3 -> LLM title, tags 3/5/marker, correspondent 8."""
+    """An enriched record: consumer title + tags 3/queue -> LLM title, tags 3/5, correspondent 8."""
     record = {
         "recorded_at": recorded_at,
         "document_id": document_id,
@@ -39,9 +42,9 @@ def _record(document_id=42, outcome="enriched", recorded_at="2026-09-10T12:00:00
         "correspondent": "Hermes",
         "duration_seconds": 1.0,
         "previous_title": "scan_0042",
-        "previous_tags": [3],
+        "previous_tags": [3, QUEUE_ID],
         "previous_correspondent": None,
-        "tags": [3, 5, MARKER_ID],
+        "tags": [3, 5],
         "correspondent_id": 8,
     }
     record.update(kw)
@@ -57,20 +60,30 @@ def _write(tmp_path, records, torn=False):
     return str(target)
 
 
-def _mock_tags(*, declined_exists=True):
-    ids = {enrich.MARKER_TAG: MARKER_ID}
+def _mock_tags(*, declined_exists=True, queue_exists=True):
+    ids = {}
+    if queue_exists:
+        ids[enrich.QUEUE_TAG] = QUEUE_ID
     if declined_exists:
         ids[enrich.NO_CORRESPONDENT_TAG] = DECLINED_ID
+    # Every id the tests use exists, except the deleted marker.
+    existing = {3, 5, 7, 31} | set(ids.values())
 
     def respond(request):
-        name = request.url.params["name__iexact"]
+        params = request.url.params
+        if "id__in" in params:
+            wanted = [int(i) for i in params["id__in"].split(",")]
+            return httpx.Response(
+                200, json={"results": [{"id": i} for i in wanted if i in existing]}
+            )
+        name = params["name__iexact"]
         results = [{"id": ids[name]}] if name in ids else []
         return httpx.Response(200, json={"results": results})
 
     return respx.get(f"{PAPERLESS}/api/tags/").mock(side_effect=respond)
 
 
-def _mock_document(document_id=42, *, title="Invoice from Hermes", tags=(3, 5, MARKER_ID),
+def _mock_document(document_id=42, *, title="Invoice from Hermes", tags=(3, 5),
                    correspondent=8):
     return respx.get(f"{PAPERLESS}/api/documents/{document_id}/").mock(
         return_value=httpx.Response(
@@ -163,7 +176,7 @@ def test_dry_run_lists_the_reversion_and_writes_nothing():
     assert outcome.status == "would-revert"
     assert outcome.payload == {
         "title": "scan_0042",
-        "tags": [3, MARKER_ID, DECLINED_ID],
+        "tags": [3, DECLINED_ID],
         "correspondent": None,
     }
     assert not patch.called
@@ -195,7 +208,7 @@ def test_write_reverts_title_tags_and_correspondent():
     assert outcome.status == "reverted"
     assert json.loads(patch.calls.last.request.content) == {
         "title": "scan_0042",
-        "tags": [3, MARKER_ID, DECLINED_ID],
+        "tags": [3, DECLINED_ID],
         "correspondent": None,
     }
 
@@ -211,12 +224,13 @@ def test_write_creates_the_decline_tag_when_missing():
 
     _run({42: _record()}, write=True)
 
-    assert json.loads(patch.calls.last.request.content)["tags"] == [3, MARKER_ID, DECLINED_ID]
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, DECLINED_ID]
 
 
 @respx.mock
-def test_a_reverted_document_keeps_the_marker_so_the_sweep_does_not_redo_it():
-    """No correspondent was assigned, so no decline tag either — only the marker."""
+def test_a_reverted_document_is_left_without_queue_so_the_sweep_does_not_redo_it():
+    """The before-state carried `queue`; replaying it verbatim would re-enrich.
+    No correspondent was assigned, so no decline tag either."""
     _mock_tags()
     _mock_document(correspondent=4)
     patch = _mock_patch()
@@ -225,7 +239,7 @@ def test_a_reverted_document_keeps_the_marker_so_the_sweep_does_not_redo_it():
 
     assert json.loads(patch.calls.last.request.content) == {
         "title": "scan_0042",
-        "tags": [3, MARKER_ID],
+        "tags": [3],
         "correspondent": 4,
     }
 
@@ -234,11 +248,11 @@ def test_a_reverted_document_keeps_the_marker_so_the_sweep_does_not_redo_it():
 def test_a_backfilled_record_reverts_only_what_it_changed():
     """Title and tags were not written (None), so the expected state is the before-state."""
     _mock_tags()
-    _mock_document(title="Curated", tags=(3, MARKER_ID), correspondent=31)
+    _mock_document(title="Curated", tags=(3,), correspondent=31)
     patch = _mock_patch()
     record = _record(
         outcome="backfilled", title=None, tags=None, correspondent_id=31,
-        previous_title="Curated", previous_tags=[3, MARKER_ID], previous_correspondent=None,
+        previous_title="Curated", previous_tags=[3], previous_correspondent=None,
     )
 
     [outcome] = _run({42: record}, write=True)
@@ -246,7 +260,7 @@ def test_a_backfilled_record_reverts_only_what_it_changed():
     assert outcome.status == "reverted"
     assert json.loads(patch.calls.last.request.content) == {
         "title": "Curated",
-        "tags": [3, MARKER_ID, DECLINED_ID],
+        "tags": [3, DECLINED_ID],
         "correspondent": None,
     }
 
@@ -267,7 +281,7 @@ def test_a_document_edited_since_is_skipped_and_reported():
 @respx.mock
 def test_a_tag_added_since_counts_as_an_edit():
     _mock_tags()
-    _mock_document(tags=(3, 5, 7, MARKER_ID))
+    _mock_document(tags=(3, 5, 7))
     patch = _mock_patch()
 
     [outcome] = _run({42: _record()}, write=True)
@@ -280,12 +294,84 @@ def test_a_tag_added_since_counts_as_an_edit():
 @respx.mock
 def test_a_second_run_reports_already_reverted():
     _mock_tags()
-    _mock_document(title="scan_0042", tags=(3, MARKER_ID, DECLINED_ID), correspondent=None)
+    _mock_document(title="scan_0042", tags=(3, DECLINED_ID), correspondent=None)
     patch = _mock_patch()
 
     [outcome] = _run({42: _record()}, write=True)
 
     assert outcome.status == "already-reverted"
+    assert not patch.called
+
+
+@respx.mock
+def test_write_never_creates_queue_just_to_leave_it_off():
+    _mock_tags(queue_exists=False)
+    _mock_document()
+    create = respx.post(f"{PAPERLESS}/api/tags/").mock(
+        return_value=httpx.Response(201, json={"id": QUEUE_ID})
+    )
+    patch = _mock_patch()
+
+    [outcome] = _run({42: _record(previous_tags=[3])}, write=True)
+
+    assert outcome.status == "reverted"
+    assert not create.called
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, DECLINED_ID]
+
+
+# --- records from before #1561 name the deleted `ai-processed` marker ---
+
+@respx.mock
+def test_a_pre_queue_record_is_not_mistaken_for_an_edit_made_since():
+    """Its after-state carries the marker, which the migration deleted from every
+    document along with the tag — so the comparison must not count it."""
+    _mock_tags()
+    _mock_document(tags=(3, 5))
+    patch = _mock_patch()
+    record = _record(previous_tags=[3], tags=[3, 5, DELETED_MARKER_ID])
+
+    [outcome] = _run({42: record}, write=True)
+
+    assert outcome.status == "reverted"
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, DECLINED_ID]
+    assert f"[{DELETED_MARKER_ID}]" in outcome.detail
+
+
+@respx.mock
+def test_a_deleted_tag_in_the_before_state_is_dropped_not_reintroduced():
+    """PATCHing an id that no longer exists would 400; dropping it is also right —
+    the marker's whole meaning is gone."""
+    _mock_tags()
+    _mock_document(title="Curated", tags=(3,), correspondent=31)
+    patch = _mock_patch()
+    record = _record(
+        outcome="backfilled", title=None, tags=None, correspondent_id=31,
+        previous_title="Curated", previous_tags=[3, DELETED_MARKER_ID],
+        previous_correspondent=None,
+    )
+
+    [outcome] = _run({42: record}, write=True)
+
+    assert outcome.status == "reverted"
+    assert json.loads(patch.calls.last.request.content) == {
+        "title": "Curated",
+        "tags": [3, DECLINED_ID],
+        "correspondent": None,
+    }
+    assert "dropped deleted tag" in outcome.detail
+
+
+@respx.mock
+def test_a_dry_run_reports_the_dropped_tag_too():
+    _mock_tags()
+    _mock_document(tags=(3, 5))
+    patch = _mock_patch()
+
+    [outcome] = _run({42: _record(previous_tags=[3, DELETED_MARKER_ID])})
+
+    assert outcome.status == "would-revert"
+    assert outcome.payload["tags"] == [3, DECLINED_ID]
+    assert "dropped deleted tag" in outcome.detail
     assert not patch.called
 
 
