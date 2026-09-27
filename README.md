@@ -316,32 +316,13 @@ they are unowned and harmless — and the file rename undoes itself: paperless
 re-renders the filename on the PATCH. Records from before this existed carry no
 `recorded_at` or before-state and are never matched.
 
-### Migrating from `ai-processed` (homelab#1561, one-off)
+### Migration from `ai-processed` (homelab#1561, done)
 
-Before #1561 convergence was an `ai-processed` marker on every enriched document
-and the sweep queried on its absence. Moving to `queue` needs one pass that gives
-`queue` to every document *without* the marker, in this order so no sweep ever runs
-against a half-migrated library:
-
-1. **Deploy the image that queries on `queue`, and create the Workflow.** Until
-   step 2 the sweep finds nothing, and the backfill may reach an unmigrated
-   document early (harmless: it only assigns a correspondent). The Workflow's
-   timing does not matter — the trigger path does not need the tag.
-2. **Queue the unmarked documents** — dry-run by default, idempotent:
-
-   ```bash
-   kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline migrate-queue
-   kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline migrate-queue --write
-   ```
-
-   It `bulk_edit`s `add_tag` onto every document matching
-   `tags__id__none=<ai-processed>,<queue>`, creating `queue` (matching *None*,
-   unowned) if the operator has not yet.
-3. **Delete the `ai-processed` tag** in the paperless UI. Safe for filenames:
-   `PAPERLESS_FILENAME_FORMAT` contains no tags, so no rename storm. Rollback copes
-   with the deleted id in older records (above).
-
-`queue_migration.py` and the `migrate-queue` subcommand can go once this has run.
+Convergence used to be an `ai-processed` marker on every enriched document. The
+one-off move to `queue` ran on 2026-09-25: every document already carried the
+marker, so nothing needed queueing, and the tag was then deleted. The
+`migrate-queue` subcommand that did it was removed afterwards; rollback still
+drops the deleted marker's id from older records (above).
 
 ## Paperless task-queue health (`paperless-health` flow)
 
