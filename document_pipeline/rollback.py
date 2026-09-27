@@ -101,17 +101,30 @@ def _state(title, tags, correspondent) -> dict:
     return {"title": title, "tags": sorted(int(t) for t in tags), "correspondent": correspondent}
 
 
+def _day(value) -> str | None:
+    """A `created` value as YYYY-MM-DD, whether paperless sent a date or a datetime."""
+    return str(value)[:10] if value else None
+
+
+def _writes_created(record: dict) -> bool:
+    """Only extract mode writes `created` (#1563), and only when pick_created allowed it."""
+    return record.get("created") is not None and record.get("previous_created") is not None
+
+
 def _expected_after(record: dict) -> dict:
     """The state the record's write left behind. None fields were not written."""
     def written(key: str, previous_key: str):
         value = record.get(key)
         return record[previous_key] if value is None else value
 
-    return _state(
+    state = _state(
         written("title", "previous_title"),
         written("tags", "previous_tags"),
         written("correspondent_id", "previous_correspondent"),
     )
+    if _writes_created(record):
+        state["created"] = _day(record["created"])
+    return state
 
 
 class _Tags:
@@ -165,13 +178,16 @@ def _target(record: dict, expected: dict, tags: _Tags) -> dict:
         declined_id = tags.get(enrich.NO_CORRESPONDENT_TAG)
         if declined_id is not None:
             target_tags = sorted(set(target_tags) | {declined_id})
-    return _state(record["previous_title"], target_tags, record["previous_correspondent"])
+    state = _state(record["previous_title"], target_tags, record["previous_correspondent"])
+    if _writes_created(record):
+        state["created"] = _day(record["previous_created"])
+    return state
 
 
 def _diff(current: dict, expected: dict) -> str:
     return ", ".join(
         f"{key} {expected[key]!r} -> {current[key]!r}"
-        for key in ("title", "tags", "correspondent")
+        for key in expected
         if current[key] != expected[key]
     )
 
@@ -199,6 +215,8 @@ def revert_document(
     current = _state(
         document.get("title"), document.get("tags") or [], document.get("correspondent")
     )
+    if "created" in expected:
+        current["created"] = _day(document.get("created"))
 
     if current == target:
         return Reversion(document_id, "already-reverted", target, detail=detail())
@@ -210,7 +228,8 @@ def revert_document(
         return Reversion(document_id, "would-revert", target, detail=detail(_diff(target, current)))
 
     # Sent whole, correspondent included: None here means "clear it", unlike
-    # patch_document where it means "leave it alone".
+    # patch_document where it means "leave it alone". `created` is in it only
+    # when the record wrote it (extract mode, #1563).
     resp = client.patch(f"{paperless_url}/api/documents/{document_id}/", json=target)
     resp.raise_for_status()
     enrich.append_result(
@@ -223,6 +242,8 @@ def revert_document(
             previous_title=current["title"],
             previous_tags=current["tags"],
             previous_correspondent=current["correspondent"],
+            created=target.get("created"),
+            previous_created=current.get("created"),
         )
     )
     logger.info("Document %s rolled back: %s", document_id, detail(_diff(target, current)))
