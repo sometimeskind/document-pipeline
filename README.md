@@ -227,17 +227,19 @@ Two things exist for the backfill specifically:
   flow-run parameter, not an env var, deliberately — the sweep's steady-state job
   is catching dropped triggers, and a dry-run default would silently disable it.
 
-### Single extraction query (`ENRICH_MODE=extract`, experiment — homelab#1563)
+### Two-query extraction (`ENRICH_MODE=extract`, experiment — homelab#1563)
 
 The default path (`ENRICH_MODE=suggest`) costs four model passes per document:
 two inside `ai_suggestions` (classification, then localization), the dedicated
-title query and the correspondent query. `extract` asks Ollama **once**, with
-one schema requiring `{title, correspondent, tags: [string], created}`, and
-derives the rest in code:
+title query and the correspondent query. `extract` costs **two**: the same
+dedicated title query, unchanged, and one "facts" query whose schema requires
+`{correspondent, tags: [string], created}`. The rest is derived in code:
 
-- **title** and **correspondent** use the dedicated prompts' wording verbatim
-  (document's own language, issuer never recipient, no legal suffixes). The
-  correspondent is applied only when the document has none, created unowned —
+- **title** comes from the title query (document's own language, #43).
+- **correspondent** uses a tighter wording than the dedicated query (sender
+  block, never the address window, name only), and trailing legal forms
+  (GmbH, B.V., N.V., Inc., AG, Ltd., "GmbH & Co. KG", …) are stripped in code
+  as well. It is applied only when the document has none, created unowned —
   same as the default path.
 - **tags** are matched against `/api/tags/`, fetched once per run,
   case- and whitespace-insensitively against **existing** names only. Unmatched
@@ -251,6 +253,13 @@ derives the rest in code:
   the document was `added` — i.e. its date regex found nothing. A date
   paperless parsed, or one set by hand, is never overwritten. The model's raw
   answer is recorded as `created_proposed` either way.
+
+An empty or malformed answer for a field leaves **that field** alone; the other
+fields are still written and the document converges (`queue` stripped). Only a
+failed Ollama call (transport, HTTP or unparseable answer) fails the document
+for the task retry. A single four-field query was tried first and failed the
+gate: the 3B model returned an empty title for 8 of 10 documents, and each one
+burned three retries.
 
 Every record carries `mode` and `model_passes` beside `duration_seconds`, so the
 two paths are comparable from the JSONL alone.
@@ -286,9 +295,7 @@ any sweep and is skipped if the hourly sweep holds the `enrich-sweep` slot.
 **Pending the gate:** `ai_suggestions`, `ENRICH_SUGGEST_TIMEOUT` and the
 `PAPERLESS_AI_*` env in homelab's `kubernetes/paperless/paperless.yaml` all
 stay until `extract` passes it and becomes the default — only then do they go
-(the Suggest button stops working; acceptable). If a 3B model with a
-four-field schema degrades titles, the fallback is two queries (facts + title),
-not four.
+(the Suggest button stops working; acceptable).
 
 ### Correspondent backfill
 
@@ -427,7 +434,7 @@ the second) rather than a walk over the task list.
 | `PAPERLESS_ADMIN_TOKEN` | no | falls back to `PAPERLESS_API_TOKEN` | Superuser Paperless token used by `enrich` |
 | `ENRICH_SWEEP_CRON` | no | unset → sweep has no schedule | Cron for the `enrich-sweep` deployment |
 | `ENRICH_SWEEP_BATCH_SIZE` | no | `20` | Documents per sweep run |
-| `ENRICH_MODE` | no | `suggest` | `suggest` (ai_suggestions + dedicated queries) or `extract` (one structured query, needs the Ollama vars; homelab#1563). Unknown values fail the run |
+| `ENRICH_MODE` | no | `suggest` | `suggest` (ai_suggestions + dedicated queries) or `extract` (title query + one structured facts query, needs the Ollama vars; homelab#1563). Unknown values fail the run |
 | `ENRICH_SUGGEST_TIMEOUT` | no | `650` | Read timeout for `ai_suggestions`, in seconds (unused by `extract`; removal pending the #1563 gate) |
 | `ENRICH_OLLAMA_URL` | no | unset → dedicated title/correspondent queries off | Ollama base URL for the queries enrich runs itself |
 | `ENRICH_OLLAMA_MODEL` | no | unset → dedicated title/correspondent queries off | Model for those queries |

@@ -1092,13 +1092,30 @@ def _mock_extract_document(
 
 def _mock_extraction(
     *, title="Factuur van Hermes", correspondent="Hermes", tags=("Invoice",), created="2026-09-01",
+    title_status=200, facts_status=200,
 ):
-    return respx.post(f"{OLLAMA}/api/chat").mock(
-        return_value=httpx.Response(200, json={"message": {"content": json.dumps({
-            "title": title, "correspondent": correspondent,
-            "tags": list(tags), "created": created,
-        })}})
-    )
+    """Serve extract mode's two queries, told apart by the schema they require:
+    the title query (["title"]) and the facts query. `tags` may be any JSON
+    value, to feed the model's malformed answers through."""
+    def respond(request):
+        if json.loads(request.content)["format"]["required"] == ["title"]:
+            status, answer = title_status, {"title": title}
+        else:
+            status, answer = facts_status, {
+                "correspondent": correspondent,
+                "tags": list(tags) if isinstance(tags, tuple) else tags,
+                "created": created,
+            }
+        if status != 200:
+            return httpx.Response(status)
+        return httpx.Response(200, json={"message": {"content": json.dumps(answer)}})
+
+    return respx.post(f"{OLLAMA}/api/chat").mock(side_effect=respond)
+
+
+def _chat_schemas(route) -> list[list[str]]:
+    """The `required` list of every /api/chat call, in order."""
+    return [json.loads(c.request.content)["format"]["required"] for c in route.calls]
 
 
 def _mock_tag_list(pages=({"invoice": 5, "Shipping": 6},)):
@@ -1230,7 +1247,7 @@ def test_created_accepts_a_datetime_shaped_created_field():
 # enrich_document in extract mode
 
 @respx.mock
-def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
+def test_extract_mode_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
     suggestions = _mock_suggestions()
@@ -1241,9 +1258,11 @@ def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
     result = _extract()
 
     assert not suggestions.called
-    assert ollama.call_count == 1
-    request = json.loads(ollama.calls.last.request.content)
-    assert request["format"]["required"] == ["title", "correspondent", "tags", "created"]
+    # The title is asked alone, with the default path's prompt (#43); the facts
+    # query carries no title at all (#1563: four fields at once lost titles).
+    assert _chat_schemas(ollama) == [["title"], ["correspondent", "tags", "created"]]
+    title_prompt = json.loads(ollama.calls[0].request.content)["messages"][0]["content"]
+    assert title_prompt == enrich.TITLE_PROMPT.format(content=_LONG_CONTENT)
     assert json.loads(patch.calls.last.request.content) == {
         "tags": [3, 5],  # `queue` stripped: the document converged
         "title": "Factuur van Hermes",
@@ -1252,7 +1271,7 @@ def test_extract_mode_is_one_ollama_query_and_no_ai_suggestions(monkeypatch):
     }
     assert result.outcome == "enriched"
     assert result.mode == "extract"
-    assert result.model_passes == 1
+    assert result.model_passes == 2
     assert result.matched_tags == [5]
     assert result.suggested_tags == ["Tax return"]
     assert result.correspondent == "Hermes"
@@ -1339,15 +1358,84 @@ def test_extract_mode_creates_a_new_correspondent_unowned(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_empty_title_raises_rather_than_patching(monkeypatch):
+def test_extract_mode_empty_title_leaves_the_title_alone_and_writes_the_rest(monkeypatch):
+    """An empty answer is the model saying "nothing here", not a failure: the
+    #1563 gate lost 8/10 documents to retrying one. The other fields still land."""
     _extract_env(monkeypatch)
-    _mock_extract_document()
-    _mock_extraction(title="  ")
+    _mock_extract_document(tags=(3, QUEUE_ID))
+    _mock_extraction(title="  ", tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
     patch = _mock_patch()
 
-    with pytest.raises(ValueError):
-        _extract()
-    assert not patch.called
+    result = _extract()
+
+    assert json.loads(patch.calls.last.request.content) == {
+        "tags": [3, 5], "correspondent": 17, "created": "2026-09-01",
+    }
+    assert result.outcome == "enriched"
+    assert result.title is None
+
+
+@respx.mock
+def test_extract_mode_empty_facts_leave_their_fields_alone(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3, QUEUE_ID))
+    _mock_extraction(correspondent=" ", tags=(), created="")
+    search = _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert not search.called
+    assert json.loads(patch.calls.last.request.content) == {
+        "tags": [3], "title": "Factuur van Hermes",
+    }
+    assert (result.correspondent, result.created, result.matched_tags) == (None, None, [])
+
+
+@respx.mock
+def test_extract_mode_all_fields_empty_still_converges(monkeypatch):
+    """Nothing to write but `queue` goes, so the sweep stops re-reading it."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3, QUEUE_ID))
+    _mock_extraction(title="", correspondent="", tags=(), created="")
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3]}
+    assert result.outcome == "enriched"
+
+
+@respx.mock
+@pytest.mark.parametrize("tags", [None, "invoice", {"name": "invoice"}, [None, 7, ""]])
+def test_extract_mode_malformed_tags_leave_the_tags_alone(monkeypatch, tags):
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3, QUEUE_ID))
+    _mock_extraction(tags=tags)
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3]
+    assert result.matched_tags == []
+
+
+@respx.mock
+def test_extract_mode_invalid_created_leaves_created_alone(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(created="sometime in September")
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    body = json.loads(patch.calls.last.request.content)
+    assert "created" not in body
+    assert body["title"] == "Factuur van Hermes"
+    assert result.created_proposed == "sometime in September"
 
 
 @respx.mock
@@ -1361,6 +1449,88 @@ def test_extract_mode_raises_on_an_ollama_failure(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         _extract()
     assert not patch.called
+
+
+@respx.mock
+@pytest.mark.parametrize("failing", ["title_status", "facts_status"])
+def test_extract_mode_raises_when_either_query_fails(monkeypatch, failing):
+    """Unlike the default path's degrading title query: a failed call must not
+    read as an empty answer, or a timeout would converge a document untitled."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(**{failing: 500})
+    patch = _mock_patch()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _extract()
+    assert not patch.called
+
+
+@respx.mock
+def test_extract_mode_raises_on_an_unparseable_answer(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(200, json={"message": {"content": "not json"}})
+    )
+    patch = _mock_patch()
+
+    with pytest.raises(ValueError):
+        _extract()
+    assert not patch.called
+
+
+@respx.mock
+def test_extract_mode_strips_a_legal_suffix_from_the_correspondent(monkeypatch):
+    """The 3B model kept "GmbH" despite the prompt in the #1563 gate run."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent="Hermes Germany GmbH")
+    search = _mock_correspondent_search(results=({"id": 17},))
+    _mock_patch()
+
+    result = _extract()
+
+    assert search.calls.last.request.url.params["name__iexact"] == "Hermes Germany"
+    assert result.correspondent == "Hermes Germany"
+
+
+# deterministic legal-suffix stripping
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Hermes Germany GmbH", "Hermes Germany"),
+    ("Coolblue B.V.", "Coolblue"),
+    ("Coolblue BV", "Coolblue"),
+    ("ING Bank N.V.", "ING Bank"),
+    ("Cloudflare, Inc.", "Cloudflare"),
+    ("Cloudflare Inc", "Cloudflare"),
+    ("Deutsche Bahn AG", "Deutsche Bahn"),
+    ("Muster GmbH & Co. KG", "Muster"),
+    ("Acme Ltd.", "Acme"),
+    ("Acme Limited", "Acme"),
+    ("Acme LLC", "Acme"),
+    ("ADAC e.V.", "ADAC"),
+    ("Airbus SE", "Airbus"),
+    ("Orange S.A.", "Orange"),
+    ("Maersk A/S", "Maersk"),
+    ("Beispiel UG (haftungsbeschränkt)", "Beispiel"),
+    ("Hermes Germany gmbh", "Hermes Germany"),
+])
+def test_strip_legal_suffixes(raw, expected):
+    assert enrich.strip_legal_suffixes(raw) == expected
+
+
+@pytest.mark.parametrize("name", [
+    "Hermes",
+    "Belastingdienst",
+    "Gemeente Amsterdam",
+    "AG",                 # nothing would be left: keep it rather than empty it
+    "Vag Inc Solutions",  # a suffix word mid-name is part of the name
+    "Texas Instruments",
+    "Dr. A. Jansen",
+])
+def test_strip_legal_suffixes_leaves_other_names_alone(name):
+    assert enrich.strip_legal_suffixes(name) == name
 
 
 @respx.mock
