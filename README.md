@@ -238,7 +238,7 @@ dedicated title query, unchanged, and one "facts" query whose schema requires
 - **title** comes from the title query (document's own language, #43).
 - **correspondent** uses a tighter wording than the dedicated query (sender
   block, never the address window, name only), and trailing legal forms
-  (GmbH, B.V., N.V., Inc., AG, Ltd., "GmbH & Co. KG", …) are stripped in code
+  (GmbH, B.V., N.V., Inc., PBC, AG, Ltd., "GmbH & Co. KG", …) are stripped in code
   as well. It is applied only when the document has none, created unowned —
   same as the default path.
 - **tags** are matched against `/api/tags/`, fetched once per run,
@@ -254,7 +254,9 @@ dedicated title query, unchanged, and one "facts" query whose schema requires
   paperless parsed, or one set by hand, is never overwritten. The model's raw
   answer is recorded as `created_proposed` either way.
 
-An empty or malformed answer for a field leaves **that field** alone; the other
+An empty or malformed answer for a field — or one that is the prompt's own
+wording coming back, which the 3B model does on content-poor documents —
+leaves **that field** alone; the other
 fields are still written and the document converges (`queue` stripped). Only a
 failed Ollama call (transport, HTTP or unparseable answer) fails the document
 for the task retry. A single four-field query was tried first and failed the
