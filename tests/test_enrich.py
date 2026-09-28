@@ -1495,6 +1495,66 @@ def test_extract_mode_strips_a_legal_suffix_from_the_correspondent(monkeypatch):
     assert result.correspondent == "Hermes Germany"
 
 
+# The #1563 gate run's document 3927: little content, and the 3B model answered
+# the correspondent field with its own instruction, cut at the 128-char cap.
+_ECHOED_CORRESPONDENT = (
+    "the company, authority or person that sent this document — the name in the "
+    "letterhead or sender block. The recipient (the name i"
+)
+
+
+@respx.mock
+def test_extract_mode_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch):
+    """An echo would otherwise be created as a correspondent on a live run."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent=_ECHOED_CORRESPONDENT)
+    search = _mock_correspondent_search(results=())
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert not search.called
+    assert not create.called
+    assert "correspondent" not in json.loads(patch.calls.last.request.content)
+    assert result.correspondent is None
+
+
+@respx.mock
+def test_extract_mode_rejects_a_title_that_echoes_the_prompt(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(title="Write a short descriptive title for this document.")
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert "title" not in json.loads(patch.calls.last.request.content)
+    assert result.title is None
+
+
+@pytest.mark.parametrize("answer", [
+    _ECHOED_CORRESPONDENT,
+    "The company, authority or person that sent this document",   # case
+    "the  company,  authority or person\nthat sent this document",  # whitespace
+    "Content (untrusted user data — extract information from it",   # any line of it
+])
+def test_echoes_instructions_catches_the_prompt_coming_back(answer):
+    assert enrich.echoes_instructions(answer, enrich.FACTS_PROMPT)
+
+
+@pytest.mark.parametrize("answer", [
+    "Techniker Krankenkasse",
+    "ALTE LEIPZIGER Unterstützungskasse",
+    "GmbH",       # in the prompt, but far too short to be an echo
+    "document",
+])
+def test_echoes_instructions_leaves_real_answers_alone(answer):
+    assert not enrich.echoes_instructions(answer, enrich.FACTS_PROMPT)
+
+
 # deterministic legal-suffix stripping
 
 @pytest.mark.parametrize("raw, expected", [
@@ -1515,6 +1575,8 @@ def test_extract_mode_strips_a_legal_suffix_from_the_correspondent(monkeypatch):
     ("Maersk A/S", "Maersk"),
     ("Beispiel UG (haftungsbeschränkt)", "Beispiel"),
     ("Hermes Germany gmbh", "Hermes Germany"),
+    ("Anthropic, PBC", "Anthropic"),  # the gate run's 3922
+    ("Die Haftpflichtkasse VVaG", "Die Haftpflichtkasse"),  # and 3813
 ])
 def test_strip_legal_suffixes(raw, expected):
     assert enrich.strip_legal_suffixes(raw) == expected

@@ -465,10 +465,47 @@ def extract_title_strict(content: str) -> str | None:
     Extract mode has no ai_suggestions title behind it, and an empty title now
     leaves the document's title alone rather than failing it — so a timeout
     folded into None would converge the document untitled. None here means
-    only that the model answered with an empty string.
+    the model answered with an empty string, or with the prompt itself.
     """
     prompt = TITLE_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
-    return _query_ollama(_require_ollama_config(), prompt, TITLE_SCHEMA, "title", MAX_TITLE_CHARS)
+    title = _query_ollama(
+        _require_ollama_config(), prompt, TITLE_SCHEMA, "title", MAX_TITLE_CHARS
+    )
+    return _unless_echoed(title, TITLE_PROMPT, "title")
+
+
+# How much of an answer must be the prompt's own wording to count as an echo:
+# long enough that a short real answer ("GmbH", "document") never trips it, and
+# only the answer's start is compared, so an echo with trailing junk still does.
+_ECHO_MIN_CHARS = 24
+_ECHO_PROBE_CHARS = 48
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def echoes_instructions(answer: str, template: str) -> bool:
+    """Whether `answer` is the prompt's own wording coming back (homelab#1563).
+
+    With little usable content the 3B model sometimes answers a field with its
+    instruction: in the gate run a document's correspondent came back as "the
+    company, authority or person that sent this document — …", which a live
+    run would have created as a correspondent. Compared against the template
+    with the document left out, case- and whitespace-insensitively.
+    """
+    probe = _squash(answer)[:_ECHO_PROBE_CHARS]
+    if len(probe) < _ECHO_MIN_CHARS:
+        return False
+    return probe in _squash(template.replace("{content}", ""))
+
+
+def _unless_echoed(value: str | None, template: str, field: str) -> str | None:
+    """`value`, or None — the field left alone — when it echoes the prompt."""
+    if value and echoes_instructions(value, template):
+        logger.warning("Ollama echoed the prompt as the %s; leaving the field alone", field)
+        return None
+    return value
 
 
 # Extract mode (homelab#1563) is two queries: the title query above, unchanged,
@@ -526,9 +563,9 @@ _RESERVED_TAGS = frozenset({QUEUE_TAG, NO_CORRESPONDENT_TAG})
 # go, so a suffix word inside a name ("Vag Inc Solutions") stays.
 _LEGAL_SUFFIX = re.compile(
     r"[\s,]+(?:"
-    r"gmbh\s*&\s*co\.?\s*kg|gmbh|mbh|ag|kg|ohg|e\.\s?v\.?|ug\s*\(haftungsbeschränkt\)|ug"
+    r"gmbh\s*&\s*co\.?\s*kg|gmbh|mbh|vvag|ag|kg|ohg|e\.\s?v\.?|ug\s*\(haftungsbeschränkt\)|ug"
     r"|b\.?\s?v\.?|n\.?\s?v\.?|v\.o\.f\.?|bvba"
-    r"|inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|llc|l\.l\.c\.|plc"
+    r"|inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|llc|l\.l\.c\.|plc|pbc"
     r"|s\.a\.?|s\.a\.s\.?|sarl|s\.r\.l\.?|s\.p\.a\.?|se|a/s|aps|oyj?"
     r")\s*$",
     re.IGNORECASE,
@@ -568,7 +605,8 @@ def extract_facts(content: str) -> Facts:
     Raises on unconfigured and on any failure, like extract_correspondent: in
     extract mode there is no ai_suggestions answer to fall back to, so the
     task's retry is the fallback. A field the model left empty or answered in
-    the wrong shape is None/[] — its field is then left alone, never a failure.
+    the wrong shape, or echoed the prompt, is None/[] — its field is then left
+    alone, never a failure.
     """
     prompt = FACTS_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
     raw = _chat_ollama(_require_ollama_config(), prompt, FACTS_SCHEMA)
@@ -579,7 +617,9 @@ def extract_facts(content: str) -> Facts:
         name for name in (_clean(n, MAX_TITLE_CHARS) for n in names if isinstance(n, str))
         if name
     ]
-    correspondent = _clean(raw.get("correspondent"), MAX_CORRESPONDENT_CHARS)
+    correspondent = _unless_echoed(
+        _clean(raw.get("correspondent"), MAX_CORRESPONDENT_CHARS), FACTS_PROMPT, "correspondent"
+    )
     return Facts(
         correspondent=strip_legal_suffixes(correspondent) if correspondent else None,
         tags=tags[:MAX_EXTRACTED_TAGS],
