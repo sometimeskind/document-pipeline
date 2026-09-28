@@ -1067,6 +1067,149 @@ def test_strip_legal_suffixes_leaves_other_names_alone(name):
     assert enrich.strip_legal_suffixes(name) == name
 
 
+# resolve_correspondent: a stripped name must find the suffixed original (homelab#1794)
+
+def _mock_correspondents(existing):
+    """Serve /api/correspondents/ over `existing` ({id: name}), honouring the
+    two lookups resolve_correspondent makes, the way paperless filters them."""
+    def respond(request):
+        params = request.url.params
+        if "name__iexact" in params:
+            wanted = params["name__iexact"].casefold()
+            hits = [i for i, n in existing.items() if n.casefold() == wanted]
+        else:
+            prefix = params["name__istartswith"].casefold()
+            hits = [i for i, n in existing.items() if n.casefold().startswith(prefix)]
+        return httpx.Response(
+            200, json={"results": [{"id": i, "name": existing[i]} for i in hits]}
+        )
+
+    return respx.get(f"{PAPERLESS}/api/correspondents/").mock(side_effect=respond)
+
+
+def _resolve(name):
+    with _client() as client:
+        return enrich.resolve_correspondent(client, PAPERLESS, name)
+
+
+@respx.mock
+def test_a_stripped_name_resolves_to_the_suffixed_original():
+    _mock_correspondents({5: "Scalable Capital Bank GmbH"})
+    create = _mock_correspondent_create()
+
+    assert _resolve("Scalable Capital Bank") == 5
+    assert not create.called
+
+
+@respx.mock
+def test_a_suffixed_name_resolves_to_a_suffix_free_original():
+    _mock_correspondents({5: "Symbox"})
+    create = _mock_correspondent_create()
+
+    assert _resolve("symbox GmbH") == 5
+    assert not create.called
+
+
+@respx.mock
+def test_an_exact_match_wins_over_a_suffixed_one():
+    """A duplicate created before the fix is exact; don't flip between the two."""
+    route = _mock_correspondents({5: "Foo GmbH", 9: "Foo"})
+
+    assert _resolve("Foo") == 9
+    assert [list(c.request.url.params) for c in route.calls] == [["name__iexact"]]
+
+
+@respx.mock
+def test_the_oldest_of_several_suffixed_spellings_wins():
+    _mock_correspondents({12: "Foo AG", 5: "Foo GmbH"})
+
+    assert _resolve("Foo") == 5
+
+
+@respx.mock
+def test_a_longer_name_sharing_the_prefix_is_not_a_match():
+    """istartswith only narrows; "Foo" must not land on "Foobar GmbH"."""
+    _mock_correspondents({5: "Foobar GmbH", 6: "Foo Bar GmbH"})
+    create = _mock_correspondent_create(correspondent_id=17)
+
+    assert _resolve("Foo") == 17
+    assert json.loads(create.calls.last.request.content) == {"name": "Foo", "owner": None}
+
+
+@respx.mock
+def test_the_prefix_lookup_asks_for_the_stripped_name():
+    route = _mock_correspondents({})
+    _mock_correspondent_create()
+
+    _resolve("Hermes Germany GmbH")
+
+    assert route.calls.last.request.url.params["name__istartswith"] == "Hermes Germany"
+
+
+@respx.mock
+@pytest.mark.parametrize("answer", ["Foo GmbH", "Foo"])
+def test_enrich_assigns_the_existing_suffixed_correspondent(monkeypatch, answer):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent=answer)
+    _mock_correspondents({5: "Foo GmbH"})
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    _extract()
+
+    assert not create.called
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 5
+
+
+@respx.mock
+@pytest.mark.parametrize("answer", ["Foo GmbH", "Foo"])
+def test_backfill_assigns_the_existing_suffixed_correspondent(monkeypatch, answer):
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3,))
+    _mock_ollama(answer)
+    _mock_correspondents({5: "Foo GmbH"})
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    _backfill()
+
+    assert not create.called
+    assert json.loads(patch.calls.last.request.content) == {"correspondent": 5}
+
+
+@respx.mock
+def test_backfill_strips_a_legal_suffix_like_enrich(monkeypatch):
+    """One rule in both paths, or each keeps creating its own spelling."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3,))
+    _mock_ollama("Hermes Germany GmbH")
+    _mock_correspondents({})
+    create = _mock_correspondent_create(correspondent_id=31)
+    _mock_patch()
+
+    result = _backfill()
+
+    assert json.loads(create.calls.last.request.content)["name"] == "Hermes Germany"
+    assert result.correspondent == "Hermes Germany"
+
+
+@respx.mock
+def test_backfill_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch):
+    """An echo is no issuer: marked declined, never created."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(3,))
+    _mock_ollama("Name the organization or person that issued or sent this document")
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    result = _backfill()
+
+    assert not create.called
+    assert json.loads(patch.calls.last.request.content) == {"tags": [3, DECLINED_ID]}
+    assert result.outcome == "declined"
+
+
 @respx.mock
 def test_enrich_raises_when_ollama_is_unconfigured(monkeypatch):
     monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)

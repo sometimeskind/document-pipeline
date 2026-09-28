@@ -217,12 +217,32 @@ def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -
     entries per document degrades the vocabulary — but a correspondent is the
     sender's own name read off the document, and refusing to create it means no
     document from a new sender ever gets one.
+
+    An exact (case-insensitive) match wins. Failing that, a correspondent whose
+    name is the same once both sides lose their legal suffix is reused, so a
+    stripped "Foo" finds the library's older "Foo GmbH" instead of duplicating
+    it (homelab#1794).
     """
-    resp = client.get(f"{paperless_url}/api/correspondents/", params={"name__iexact": name})
+    url = f"{paperless_url}/api/correspondents/"
+    resp = client.get(url, params={"name__iexact": name})
     resp.raise_for_status()
     results = resp.json().get("results") or []
     if results:
         return int(results[0]["id"])
+
+    # istartswith only narrows the list server-side (one page, never the whole
+    # list per document); the stripped comparison decides. The oldest of
+    # several spellings wins, which is the pre-#1563 original.
+    stripped = strip_legal_suffixes(name)
+    resp = client.get(url, params={"name__istartswith": stripped, "page_size": 100})
+    resp.raise_for_status()
+    key = _squash(stripped)
+    matches = sorted(
+        int(c["id"]) for c in resp.json().get("results") or []
+        if _squash(strip_legal_suffixes(str(c.get("name") or ""))) == key
+    )
+    if matches:
+        return matches[0]
 
     resp = client.post(
         f"{paperless_url}/api/correspondents/", json={"name": name, "owner": None}
@@ -353,13 +373,20 @@ def extract_correspondent(content: str) -> str | None:
     The backfill's query. The correspondent IS the job there, and a document
     marked `no-correspondent` on a transient Ollama timeout would be lost to
     the backfill for good. So a failure raises for Prefect to retry, and None
-    means exactly one thing: the model found no clear issuer.
+    means the model found no clear issuer, or answered with the prompt itself.
+    The answer gets the same echo guard and suffix stripping as extract_facts,
+    or the two paths keep creating each other's spelling (homelab#1794).
     """
     config = _require_ollama_config()
     prompt = CORRESPONDENT_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
-    return _query_ollama(
-        config, prompt, CORRESPONDENT_SCHEMA, "correspondent", MAX_CORRESPONDENT_CHARS
+    name = _unless_echoed(
+        _query_ollama(
+            config, prompt, CORRESPONDENT_SCHEMA, "correspondent", MAX_CORRESPONDENT_CHARS
+        ),
+        CORRESPONDENT_PROMPT,
+        "correspondent",
     )
+    return strip_legal_suffixes(name) if name else None
 
 
 def extract_title(content: str) -> str | None:
