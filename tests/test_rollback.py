@@ -27,7 +27,7 @@ SINCE = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 
 def _client():
-    return enrich.open_client("tok", suggest_timeout=5.0)
+    return enrich.open_client("tok")
 
 
 def _record(document_id=42, outcome="enriched", recorded_at="2026-09-10T12:00:00+00:00", **kw):

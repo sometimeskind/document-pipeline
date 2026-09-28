@@ -1,8 +1,10 @@
 """Enrich a consumed Paperless document with an LLM title and matched tags.
 
 Paperless 3.0 ships LLM suggestions but only behind the manual "Suggest" button
-on the document detail page — nothing runs during consumption. This is that
-missing automation, ported from the `post-consume.sh` hook it replaces.
+on the document detail page — nothing runs during consumption. This started as
+that missing automation, ported from the `post-consume.sh` hook it replaces;
+since homelab#1563 it asks Ollama directly (a title query and a facts query)
+instead of going through paperless's `ai_suggestions`.
 
 Paperless's consume is an external async step in this pipeline: the flows POST a
 document and paperless does the OCR. Enrichment reads `document.content`, so it
@@ -60,13 +62,10 @@ QUEUE_TAG = "queue"
 # document out of the query on its own) and survives losing the state PVC.
 NO_CORRESPONDENT_TAG = "no-correspondent"
 
-# `ai_suggestions` is one request that runs TWO Ollama queries: a classification
-# query, then a localization query because PAPERLESS_AI_LLM_OUTPUT_LANGUAGE is
-# set. So this must exceed twice PAPERLESS_AI_LLM_REQUEST_TIMEOUT (300s). The
-# point is for paperless's own timeout to fire first and return a clean 503,
-# rather than us severing the connection while Ollama is still generating.
-# Typical real cost is ~60s; this ceiling only matters when something is wrong.
-DEFAULT_SUGGEST_TIMEOUT = 650.0
+# Paperless calls are plain REST now that no request waits on the LLM
+# (homelab#1563 dropped ai_suggestions); the slowest is a PATCH that re-renders
+# the stored filename.
+PAPERLESS_READ_TIMEOUT = 60.0
 
 DEFAULT_RESULTS_PATH = "/state/enrich/results.jsonl"
 
@@ -75,16 +74,6 @@ DEFAULT_RESULTS_PATH = "/state/enrich/results.jsonl"
 # real outcome after; `rollback` treats a pending record as revertible because its
 # "changed since" check tells a PATCH that landed from one that did not.
 PENDING_OUTCOME = "pending"
-
-# How a document is enriched (homelab#1563). `suggest` is the four-pass path:
-# ai_suggestions (two passes) plus the dedicated title and correspondent
-# queries. `extract` is two: the same title query and one structured query for
-# correspondent, tags and created, with the tag matching and the created-date
-# rule done here in code. `extract` is an experiment gated on a dry-run
-# comparison, which is why `suggest` stays the default until the gate passes.
-ENRICH_MODES = ("suggest", "extract")
-DEFAULT_ENRICH_MODE = "suggest"
-
 
 @dataclass
 class EnrichResult:
@@ -101,7 +90,7 @@ class EnrichResult:
     suggested_tags: list[str] = field(default_factory=list)
     # Name of the correspondent assigned (or, on a dry run, the one that would
     # be). Unlike suggested_tags these ARE applied, creation included — see
-    # pick_correspondent for why that is not the vocabulary-growth mistake.
+    # resolve_correspondent for why that is not the vocabulary-growth mistake.
     correspondent: str | None = None
     duration_seconds: float = 0.0
     # The document as `fetch_document` returned it, before anything was
@@ -114,13 +103,11 @@ class EnrichResult:
     # None means this write did not touch the field, like patch_document's rule.
     tags: list[int] | None = None
     correspondent_id: int | None = None
-    # Which path produced this record and how many model passes it cost —
-    # what the #1563 gate compares. None/0 on the skip outcomes, which query
-    # nothing.
-    mode: str | None = None
+    # How many model passes this record cost (#1563); 0 on the skip outcomes,
+    # which query nothing. Records from before #1563 also carry `mode`.
     model_passes: int = 0
-    # Extract mode only: the date written to `created` (or, on a dry run, that
-    # would be), and the model's raw answer whether or not the rule accepted it.
+    # The date written to `created` (or, on a dry run, that would be), and the
+    # model's raw answer whether or not pick_created accepted it.
     # `created` doubles as the after-state for rollback: None means not written.
     created: str | None = None
     created_proposed: str | None = None
@@ -129,42 +116,15 @@ class EnrichResult:
     previous_created: str | None = None
 
 
-def resolve_mode(mode: str | None) -> str:
-    """The enrich mode: an explicit value, else ENRICH_MODE, else `suggest`.
-
-    An unknown value raises rather than falling back, so a typo in the manifest
-    fails every run loudly instead of silently running the other path.
-    """
-    resolved = mode or os.environ.get("ENRICH_MODE") or DEFAULT_ENRICH_MODE
-    if resolved not in ENRICH_MODES:
-        raise ValueError(f"Unknown enrich mode {resolved!r}; expected one of {ENRICH_MODES}")
-    return resolved
-
-
-def open_client(paperless_token: str, suggest_timeout: float | None = None) -> httpx.Client:
-    """A Paperless client whose read timeout accommodates the LLM round trip."""
-    if suggest_timeout is None:
-        suggest_timeout = float(os.environ.get("ENRICH_SUGGEST_TIMEOUT", DEFAULT_SUGGEST_TIMEOUT))
+def open_client(paperless_token: str) -> httpx.Client:
     return httpx.Client(
         headers={"Authorization": f"Token {paperless_token}"},
-        timeout=httpx.Timeout(30.0, read=suggest_timeout),
+        timeout=httpx.Timeout(30.0, read=PAPERLESS_READ_TIMEOUT),
     )
 
 
 def fetch_document(client: httpx.Client, paperless_url: str, document_id: int) -> dict:
     resp = client.get(f"{paperless_url}/api/documents/{document_id}/")
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_suggestions(client: httpx.Client, paperless_url: str, document_id: int) -> dict:
-    """Ask Paperless for the LLM suggestion.
-
-    This is the endpoint that actually runs the configured PAPERLESS_AI_*
-    backend. The similarly named `/suggestions/` is classifier-only and returns
-    no title at all.
-    """
-    resp = client.get(f"{paperless_url}/api/documents/{document_id}/ai_suggestions/")
     resp.raise_for_status()
     return resp.json()
 
@@ -235,30 +195,6 @@ def merge_tags(existing: list[int], added: list[int]) -> list[int]:
     return sorted({int(t) for t in existing} | {int(t) for t in added})
 
 
-def pick_correspondent(suggestions: dict) -> tuple[int | None, str | None]:
-    """(existing id, name to create) from the suggestion — at most one is set.
-
-    `correspondents` are ids paperless already matched (exact, then difflib
-    fuzzy) against EXISTING correspondents; a match wins because it cannot add
-    a new spelling. Otherwise the first non-blank `suggested_correspondents`
-    name is the creation candidate.
-
-    Creating from an LLM name is the opposite of the suggested_tags policy, and
-    deliberately so (#1363): a tag is a taxonomy choice, where an LLM inventing
-    entries per document degrades the vocabulary — but a correspondent is the
-    sender's own name read off the document, and refusing to create it means no
-    document from a new sender ever gets one.
-    """
-    matched = [int(c) for c in suggestions.get("correspondents") or []]
-    if matched:
-        return matched[0], None
-    for raw in suggestions.get("suggested_correspondents") or []:
-        name = " ".join(str(raw).split())[:MAX_CORRESPONDENT_CHARS]
-        if name:
-            return None, name
-    return None, None
-
-
 def fetch_correspondent_name(
     client: httpx.Client, paperless_url: str, correspondent_id: int
 ) -> str:
@@ -275,6 +211,12 @@ def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -
     paperless's match_correspondents_by_name filters through
     get_objects_for_user_owner_aware — an owned correspondent is silently
     invisible to matching on other users' documents forever (#1292).
+
+    Creating from an LLM name is the opposite of the suggested_tags policy, and
+    deliberately so (#1363): a tag is a taxonomy choice, where an LLM inventing
+    entries per document degrades the vocabulary — but a correspondent is the
+    sender's own name read off the document, and refusing to create it means no
+    document from a new sender ever gets one.
     """
     resp = client.get(f"{paperless_url}/api/correspondents/", params={"name__iexact": name})
     resp.raise_for_status()
@@ -291,13 +233,12 @@ def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -
     return correspondent_id
 
 
-# Paperless 3.0.5's own suggestion pass never yields a correspondent: its
-# DocumentClassifierSchema leaves the field optional (only `title` is required)
-# and the prompt asks for "names of people or organizations" while the JSON key
-# is the jargon word `correspondents` — a mapping qwen2.5:3b never makes. It
-# routes org names into suggested_tags instead (verified over 3 sweep batches:
-# 24/24 documents empty, #1366). So when paperless comes back empty, ask Ollama
-# ourselves with a prompt we own and a schema that REQUIRES the field.
+# Every model query is ours, with a prompt owned here and a schema that
+# REQUIRES its fields. Paperless's own ai_suggestions pass, which enrichment
+# used until homelab#1563, never yielded a correspondent (#1366: its schema
+# leaves the field optional and qwen2.5:3b never maps the jargon key) and had
+# no language pin for titles (#43). CORRESPONDENT_PROMPT is the backfill's
+# (#1373); enrichment asks for the correspondent in FACTS_PROMPT.
 #
 # Content is capped well below paperless's [:4000]: the issuer and the subject
 # are both near the top of the document, and prompt eval is the expensive part
@@ -328,11 +269,11 @@ CORRESPONDENT_SCHEMA = {
     "required": ["correspondent"],
 }
 
-# Paperless's classification prompt has no language instruction and no config
-# hook for one, so the model sometimes spontaneously translates a title (#43:
-# a Dutch document titled in English in the same batch where a German one kept
-# its German title). A dedicated query with a prompt owned here pins the
-# language; the ai_suggestions title remains only the fallback.
+# The title is asked on its own, with the language pinned: paperless's
+# classification prompt had no language instruction, and the model sometimes
+# translated a title (#43: a Dutch document titled in English in the same batch
+# where a German one kept its German title). Asked alongside the other fields,
+# a 3B model gave up on it (homelab#1563), hence a query of its own.
 TITLE_PROMPT = """\
 Write a short descriptive title for this document. Respond in the language the
 document itself is written in — never translate the title into another
@@ -350,11 +291,7 @@ TITLE_SCHEMA = {
 
 
 def _ollama_config() -> tuple[str, str] | None:
-    """(url, model), or None when either env var is unset.
-
-    Unconfigured means off — the image can land before the manifest that
-    configures it, same reasoning as the token fallback in flow.py.
-    """
+    """(url, model), or None when either env var is unset."""
     url = os.environ.get("ENRICH_OLLAMA_URL")
     model = os.environ.get("ENRICH_OLLAMA_MODEL")
     if not url or not model:
@@ -403,32 +340,6 @@ def _query_ollama(
     return value or None
 
 
-def _ollama_field(prompt: str, schema: dict, field: str, max_chars: int) -> str | None:
-    """`_query_ollama`, degraded: None on unconfigured and on any failure.
-
-    Callers treat None as "fall back", so every error degrades with a warning
-    rather than raising.
-    """
-    config = _ollama_config()
-    if config is None:
-        return None
-    try:
-        return _query_ollama(config, prompt, schema, field, max_chars)
-    except (httpx.HTTPError, KeyError, ValueError) as exc:
-        logger.warning("Ollama %s query failed: %s", field, exc)
-        return None
-
-
-def extract_correspondent_fallback(content: str) -> str | None:
-    """Ask Ollama directly who issued the document. None on any failure.
-
-    A failed extraction must never cost the document its title, so None covers
-    unconfigured, any error, and "no clear issuer" alike.
-    """
-    prompt = CORRESPONDENT_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
-    return _ollama_field(prompt, CORRESPONDENT_SCHEMA, "correspondent", MAX_CORRESPONDENT_CHARS)
-
-
 def _require_ollama_config() -> tuple[str, str]:
     config = _ollama_config()
     if config is None:
@@ -439,12 +350,10 @@ def _require_ollama_config() -> tuple[str, str]:
 def extract_correspondent(content: str) -> str | None:
     """Ask Ollama who issued the document. Raises on any failure.
 
-    The backfill's variant of `extract_correspondent_fallback`, which folds
-    failure into None because the title outranks the correspondent there. Here
-    the correspondent IS the job, and a document marked `no-correspondent` on a
-    transient Ollama timeout would be lost to the backfill for good. So a
-    failure raises for Prefect to retry, and None means exactly one thing: the
-    model found no clear issuer.
+    The backfill's query. The correspondent IS the job there, and a document
+    marked `no-correspondent` on a transient Ollama timeout would be lost to
+    the backfill for good. So a failure raises for Prefect to retry, and None
+    means exactly one thing: the model found no clear issuer.
     """
     config = _require_ollama_config()
     prompt = CORRESPONDENT_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
@@ -454,18 +363,12 @@ def extract_correspondent(content: str) -> str | None:
 
 
 def extract_title(content: str) -> str | None:
-    """Ask Ollama for a title in the document's own language. None on any failure."""
-    prompt = TITLE_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
-    return _ollama_field(prompt, TITLE_SCHEMA, "title", MAX_TITLE_CHARS)
+    """Ask Ollama for a title in the document's own language. Raises on any failure.
 
-
-def extract_title_strict(content: str) -> str | None:
-    """`extract_title`'s query, raising on any failure (extract mode, homelab#1563).
-
-    Extract mode has no ai_suggestions title behind it, and an empty title now
-    leaves the document's title alone rather than failing it — so a timeout
-    folded into None would converge the document untitled. None here means
-    the model answered with an empty string, or with the prompt itself.
+    An empty title leaves the document's title alone rather than failing it,
+    so a failure must never fold into None: a timeout would converge the
+    document untitled. None means the model answered with an empty string, or
+    with the prompt itself.
     """
     prompt = TITLE_PROMPT.format(content=content[:FALLBACK_CONTENT_CHARS])
     title = _query_ollama(
@@ -508,8 +411,8 @@ def _unless_echoed(value: str | None, template: str, field: str) -> str | None:
     return value
 
 
-# Extract mode (homelab#1563) is two queries: the title query above, unchanged,
-# and this one for everything else. The first cut asked for all four fields at
+# Enrichment (homelab#1563) is two queries: the title query above and this one
+# for everything else. The first cut asked for all four fields at
 # once, and at 3B the model gave up on the title — 8 of 10 documents came back
 # with an empty one — so the title, the field the pipeline exists for, is asked
 # alone again. Tags are proposed freely and matched against the existing
@@ -602,9 +505,8 @@ def _clean(raw: object, max_chars: int) -> str | None:
 def extract_facts(content: str) -> Facts:
     """Ask Ollama for correspondent, tags and created in one query.
 
-    Raises on unconfigured and on any failure, like extract_correspondent: in
-    extract mode there is no ai_suggestions answer to fall back to, so the
-    task's retry is the fallback. A field the model left empty or answered in
+    Raises on unconfigured and on any failure, like extract_title: the task's
+    retry is the fallback. A field the model left empty or answered in
     the wrong shape, or echoed the prompt, is None/[] — its field is then left
     alone, never a failure.
     """
@@ -782,11 +684,19 @@ def enrich_document(
     queue_id: int,
     *,
     dry_run: bool = False,
-    mode: str | None = None,
     tag_vocabulary: dict[str, int] | None = None,
     sample: bool = False,
 ) -> EnrichResult:
-    """Retitle and tag one document. Raises on any Paperless or LLM failure.
+    """Retitle and tag one document. Raises on any Paperless or Ollama failure.
+
+    Two model passes (homelab#1563): the title query and the facts query
+    (correspondent, tags, created). The write rules: tags as a union with
+    `queue` stripped last, correspondent only when there is none (created
+    unowned), `created` only under pick_created's rule, and nothing at all on a
+    dry run. An empty or unusable answer for a field leaves that field alone
+    rather than failing the document — retrying a model that has nothing to say
+    only burns the Ollama slot — and the document still converges. Only a
+    failed call raises, for the task retry.
 
     Does NOT require `queue` on the document (#1561): the trigger path enriches
     whatever it is handed — a UI upload can dodge the workflow — and strips the
@@ -798,16 +708,14 @@ def enrich_document(
     also makes it non-resuming — it re-reports the same documents every time —
     which is exactly what makes a sample reviewable before the live pass.
 
-    `mode` picks the path (see resolve_mode). `tag_vocabulary` is extract
-    mode's tag list, fetched once per run by the sweep; left None, it is
-    fetched here. `sample` is the #1563 gate's comparison run: dry-run only,
-    it enriches a document past a curated title (whether or not it still
-    carries `queue`, which nothing here requires), and reports the model's
-    correspondent past an existing assignment — so both modes can be compared
-    on the same already-enriched documents.
+    `tag_vocabulary` is the existing tag list, fetched once per run by the
+    sweep; left None, it is fetched here. `sample` is a dry-run re-enrichment
+    of already processed documents, for comparing a prompt change on a fixed
+    set (#1563): it enriches a document past a curated title (whether or not it
+    still carries `queue`, which nothing here requires), and reports the
+    model's correspondent past an existing assignment.
     """
     started = time.perf_counter()
-    mode = resolve_mode(mode)
     if sample and not dry_run:
         raise ValueError("sample re-enriches processed documents and is dry-run only")
 
@@ -847,100 +755,10 @@ def enrich_document(
             **previous_state(document),
         )
 
-    if mode == "extract":
-        return _enrich_by_extraction(
-            client, paperless_url, document, queue_id, started,
-            dry_run=dry_run, tag_vocabulary=tag_vocabulary, sample=sample,
-        )
-
-    # ai_suggestions is two model passes (classification, then localization);
-    # each dedicated query adds one when Ollama is configured.
-    ollama_on = _ollama_config() is not None
-    passes = 2 + ollama_on
-    suggestions = fetch_suggestions(client, paperless_url, document_id)
-    content = document.get("content") or ""
-    # The dedicated query wins because its prompt pins the document's own
-    # language (#43); the ai_suggestions title — still fetched for the tags —
-    # is only the fallback when that query is unconfigured or fails.
-    title = normalize_title(extract_title(content) or suggestions.get("title"))
-    # `tags` are ids of tags that ALREADY EXIST — paperless's match_tags_by_name
-    # never creates one, so applying them can never grow the vocabulary.
-    matched_tags = [int(t) for t in suggestions.get("tags") or []]
-    suggested_tags = [" ".join(str(name).split()) for name in suggestions.get("suggested_tags") or []]
-
-    if not title:
-        raise ValueError(f"LLM returned an empty title for document {document_id}")
-
-    # Correspondent: only when the document has none — an existing assignment,
-    # however it got there, outranks the LLM. The matched-id read and the
-    # get-or-create are both idempotent, so a retried PATCH cannot duplicate.
-    correspondent_id: int | None = None
-    correspondent_name: str | None = None
-    if document.get("correspondent") is None or sample:
-        matched_correspondent, new_correspondent = pick_correspondent(suggestions)
-        if matched_correspondent is None and new_correspondent is None:
-            passes += ollama_on
-            # Paperless's pass reliably yields nothing (#1366) — ask Ollama
-            # ourselves. Runs on dry runs too, like the suggestions fetch: the
-            # cost is the point of sampling, and nothing is written.
-            new_correspondent = extract_correspondent_fallback(content)
-        if matched_correspondent is not None:
-            correspondent_id = matched_correspondent
-            correspondent_name = fetch_correspondent_name(
-                client, paperless_url, matched_correspondent
-            )
-        elif new_correspondent and not dry_run:
-            correspondent_id = resolve_correspondent(client, paperless_url, new_correspondent)
-            correspondent_name = new_correspondent
-        elif new_correspondent:
-            # Dry run reports the name but must not create anything.
-            correspondent_name = new_correspondent
-
-    if dry_run:
-        logger.info(
-            "Document %s WOULD be retitled -> %r (tags: %s + %s, unmatched: %s, correspondent: %s)",
-            document_id, title, existing_tags or "none", matched_tags or "none",
-            suggested_tags or "none", correspondent_name or "none",
-        )
-        return EnrichResult(
-            document_id=document_id,
-            outcome="dry-run",
-            title=title,
-            matched_tags=matched_tags,
-            suggested_tags=suggested_tags,
-            correspondent=correspondent_name,
-            duration_seconds=time.perf_counter() - started,
-            mode=mode,
-            model_passes=passes,
-            **previous_state(document),
-        )
-
-    tags = converged_tags(merge_tags(existing_tags, matched_tags), queue_id)
-    result = EnrichResult(
-        document_id=document_id,
-        outcome="enriched",
-        title=title,
-        matched_tags=matched_tags,
-        suggested_tags=suggested_tags,
-        correspondent=correspondent_name,
-        tags=tags,
-        correspondent_id=correspondent_id,
-        mode=mode,
-        model_passes=passes,
-        **previous_state(document),
+    return _enrich(
+        client, paperless_url, document, queue_id, started,
+        dry_run=dry_run, tag_vocabulary=tag_vocabulary, sample=sample,
     )
-    append_result(replace(result, outcome=PENDING_OUTCOME))
-    patch_document(
-        client, paperless_url, document_id, tags, title=title, correspondent=correspondent_id
-    )
-
-    logger.info(
-        "Document %s retitled -> %r (tags: %s + %s, correspondent: %s)",
-        document_id, title, existing_tags or "none", matched_tags or "none",
-        correspondent_name or "none",
-    )
-    result.duration_seconds = time.perf_counter() - started
-    return result
 
 
 def _converge(
@@ -958,7 +776,7 @@ def _converge(
         patch_document(client, paperless_url, document_id, tags)
 
 
-def _enrich_by_extraction(
+def _enrich(
     client: httpx.Client,
     paperless_url: str,
     document: dict,
@@ -969,22 +787,12 @@ def _enrich_by_extraction(
     tag_vocabulary: dict[str, int] | None,
     sample: bool,
 ) -> EnrichResult:
-    """The extract-mode half of enrich_document: a title and a facts query.
-
-    Same write rules as the suggest path — tags as a union with `queue`
-    stripped last, correspondent only when there is none (created unowned), and
-    nothing at all on a dry run — plus `created` under pick_created's rule.
-
-    Unlike the suggest path, an empty or unusable answer for a field leaves
-    that field alone rather than failing the document (homelab#1563): retrying
-    a model that has nothing to say only burns the Ollama slot. The document
-    still converges. Only a failed call raises, for the task retry.
-    """
+    """enrich_document past the skips: the two queries and the write."""
     document_id = int(document["id"])
     existing_tags = [int(t) for t in document.get("tags") or []]
 
     content = document.get("content") or ""
-    title = normalize_title(extract_title_strict(content)) or None
+    title = normalize_title(extract_title(content)) or None
     facts = extract_facts(content)
 
     if tag_vocabulary is None:
@@ -1006,7 +814,6 @@ def _enrich_by_extraction(
         matched_tags=matched_tags,
         suggested_tags=suggested_tags,
         correspondent=correspondent_name,
-        mode="extract",
         model_passes=2,
         created=created,
         created_proposed=facts.created,
@@ -1015,28 +822,28 @@ def _enrich_by_extraction(
     if dry_run:
         logger.info(
             "Document %s WOULD be retitled -> %s (tags: %s + %s, unmatched: %s, "
-            "correspondent: %s, created: %s) [extract]",
+            "correspondent: %s, created: %s)",
             document_id, repr(title) if title else "unchanged", existing_tags or "none", matched_tags or "none",
             suggested_tags or "none", correspondent_name or "none", created or "unchanged",
         )
         result.duration_seconds = time.perf_counter() - started
         return result
 
-    # converged_tags goes last, as on the suggest path (#1561): it strips
-    # `queue` even if the model's tags somehow carried it back in.
+    # converged_tags goes last (#1561): it strips `queue` even if the model's
+    # tags somehow carried it back in.
     tags = converged_tags(merge_tags(existing_tags, matched_tags), queue_id)
     result.outcome = "enriched"
     result.tags = tags
     result.correspondent_id = correspondent_id
-    # Before the PATCH, like the default path (#1562): a crash mid-PATCH still
-    # leaves the before-state, `created` included, on disk.
+    # Before the PATCH (#1562): a crash mid-PATCH still leaves the
+    # before-state, `created` included, on disk.
     append_result(replace(result, outcome=PENDING_OUTCOME))
     patch_document(
         client, paperless_url, document_id, tags,
         title=title, correspondent=correspondent_id, created=created,
     )
     logger.info(
-        "Document %s retitled -> %s (tags: %s + %s, correspondent: %s, created: %s) [extract]",
+        "Document %s retitled -> %s (tags: %s + %s, correspondent: %s, created: %s)",
         document_id, repr(title) if title else "unchanged", existing_tags or "none", matched_tags or "none",
         correspondent_name or "none", created or "unchanged",
     )
@@ -1231,42 +1038,3 @@ def rank_suggested_tags(path: str | None = None) -> tuple[int, list[tuple[str, i
         for name, count in counts.most_common()
     ]
     return len(documents), ranked
-
-
-def compare_modes(path: str | None = None) -> list[dict]:
-    """Pair each document's latest `suggest` and `extract` dry runs (homelab#1563).
-
-    The gate's raw material: only `dry-run` records that carry a mode count, so
-    live results and pre-#1563 records cannot pollute the comparison, and a
-    re-run of the sample supersedes the earlier one. Documents missing either
-    side are left out. Correspondent agreement is case-insensitive; None when
-    either side has no correspondent to compare.
-    """
-    target = Path(path or os.environ.get("ENRICH_RESULTS_PATH", DEFAULT_RESULTS_PATH))
-    latest: dict[int, dict[str, dict]] = {}
-    with target.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("outcome") != "dry-run" or record.get("mode") not in ENRICH_MODES:
-                continue
-            latest.setdefault(int(record["document_id"]), {})[record["mode"]] = record
-
-    pairs = []
-    for document_id in sorted(latest):
-        sides = latest[document_id]
-        if not all(m in sides for m in ENRICH_MODES):
-            continue
-        a, b = sides["suggest"].get("correspondent"), sides["extract"].get("correspondent")
-        pairs.append({
-            "document_id": document_id,
-            "suggest": sides["suggest"],
-            "extract": sides["extract"],
-            "correspondent_agrees": (a.casefold() == b.casefold()) if a and b else None,
-        })
-    return pairs
