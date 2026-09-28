@@ -203,6 +203,35 @@ def fetch_correspondent_name(
     return str(resp.json().get("name") or "")
 
 
+def _server_prefixes(name: str) -> list[str]:
+    """What to ask paperless's name__istartswith for, so it folds case correctly.
+
+    The paperless database has C collation, where UPPER() folds ASCII only
+    (homelab#1802: upper('möbel') is 'MöBEL'), so "Möbel-Eins" would never
+    istartswith-match "MÖBEL-EINS". Ask for the leading ASCII run instead ("M")
+    and let the casefolded comparison decide. A name that starts with a
+    non-ASCII letter asks for both of its cases: under C, istartswith on "Ä"
+    matches exactly "Ä", and paperless has no case-sensitive startswith.
+    """
+    run = ""
+    for ch in name:
+        if not ch.isascii():
+            break
+        run += ch
+    if run == name or run.strip():
+        return [run]
+    first = name[0]
+    return list(dict.fromkeys([first.upper(), first.lower()]))
+
+
+def _correspondents_starting_with(
+    client: httpx.Client, url: str, prefix: str
+) -> list[dict]:
+    resp = client.get(url, params={"name__istartswith": prefix, "page_size": 100})
+    resp.raise_for_status()
+    return resp.json().get("results") or []
+
+
 def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -> int:
     """Return the id of the named correspondent, creating it UNOWNED if missing.
 
@@ -234,11 +263,11 @@ def resolve_correspondent(client: httpx.Client, paperless_url: str, name: str) -
     # list per document); the stripped comparison decides. The oldest of
     # several spellings wins, which is the pre-#1563 original.
     stripped = strip_legal_suffixes(name)
-    resp = client.get(url, params={"name__istartswith": stripped, "page_size": 100})
-    resp.raise_for_status()
     key = _squash(stripped)
     matches = sorted(
-        int(c["id"]) for c in resp.json().get("results") or []
+        int(c["id"])
+        for prefix in _server_prefixes(stripped)
+        for c in _correspondents_starting_with(client, url, prefix)
         if _squash(strip_legal_suffixes(str(c.get("name") or ""))) == key
     )
     if matches:

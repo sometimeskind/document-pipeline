@@ -1069,17 +1069,28 @@ def test_strip_legal_suffixes_leaves_other_names_alone(name):
 
 # resolve_correspondent: a stripped name must find the suffixed original (homelab#1794)
 
+def _c_upper(text):
+    """UPPER() under the paperless database's C collation: ASCII letters only
+    (homelab#1802: upper('möbel') is 'MöBEL')."""
+    return "".join(ch.upper() if ch.isascii() else ch for ch in text)
+
+
 def _mock_correspondents(existing):
-    """Serve /api/correspondents/ over `existing` ({id: name}), honouring the
-    two lookups resolve_correspondent makes, the way paperless filters them."""
+    """Serve /api/correspondents/ over `existing` ({id: name}), filtering the way
+    paperless does: name__iexact / name__istartswith, compared through the C
+    collation's ASCII-only UPPER(). Any other filter is refused rather than
+    ignored, which is what django-filter would do with it: return everything."""
     def respond(request):
-        params = request.url.params
-        if "name__iexact" in params:
-            wanted = params["name__iexact"].casefold()
-            hits = [i for i, n in existing.items() if n.casefold() == wanted]
+        params = dict(request.url.params)
+        params.pop("page_size", None)
+        [(lookup, value)] = params.items()
+        wanted = _c_upper(value)
+        if lookup == "name__iexact":
+            hits = [i for i, n in existing.items() if _c_upper(n) == wanted]
+        elif lookup == "name__istartswith":
+            hits = [i for i, n in existing.items() if _c_upper(n).startswith(wanted)]
         else:
-            prefix = params["name__istartswith"].casefold()
-            hits = [i for i, n in existing.items() if n.casefold().startswith(prefix)]
+            raise AssertionError(f"paperless has no {lookup} filter")
         return httpx.Response(
             200, json={"results": [{"id": i, "name": existing[i]} for i in hits]}
         )
@@ -1144,6 +1155,33 @@ def test_the_prefix_lookup_asks_for_the_stripped_name():
     _resolve("Hermes Germany GmbH")
 
     assert route.calls.last.request.url.params["name__istartswith"] == "Hermes Germany"
+
+
+# The C collation folds ASCII only (homelab#1802)
+
+@pytest.mark.parametrize("name, existing", [
+    ("Möbel-Eins", "MÖBEL-EINS"),
+    ("MÖBEL-EINS", "Möbel-Eins"),
+    ("KB KÜPPER UND KOLLEGEN BERLIN", "KB Küpper und Kollegen Berlin GmbH"),
+    ("ÄRZTEKAMMER BERLIN", "Ärztekammer Berlin"),   # the first letter is the one
+    ("ärztekammer berlin", "Ärztekammer Berlin"),
+    ("Öko-Test", "ÖKO-TEST GmbH"),
+])
+@respx.mock
+def test_a_non_ascii_case_difference_still_matches(name, existing):
+    _mock_correspondents({5: existing})
+    create = _mock_correspondent_create()
+
+    assert _resolve(name) == 5
+    assert not create.called
+
+
+@respx.mock
+def test_a_non_ascii_leading_letter_does_not_match_a_different_name():
+    _mock_correspondents({5: "Ärzteblatt", 6: "Ökotest"})
+    create = _mock_correspondent_create(correspondent_id=17)
+
+    assert _resolve("Ärztekammer") == 17
 
 
 @respx.mock
