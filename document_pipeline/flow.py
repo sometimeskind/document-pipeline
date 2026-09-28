@@ -159,17 +159,16 @@ def enrich_document_task(
     document_id: int,
     queue_id: int | None = None,
     dry_run: bool = False,
-    mode: str | None = None,
     tag_vocabulary: dict[str, int] | None = None,
     sample: bool = False,
 ) -> enrich.EnrichResult:
     """Retitle and tag one consumed document.
 
-    Retries cover the 503 `ai_suggestions` returns when Ollama is saturated —
-    the failure mode that used to cost a document its title permanently, because
-    the shell hook had nothing to re-queue it. Re-running is idempotent (same
-    title, union of tags) and paperless caches LLM suggestions per document, so
-    a retry inside the cache window costs no further inference.
+    Retries cover a failed Ollama call (a timeout when it is saturated) — the
+    failure mode that used to cost a document its title permanently, because
+    the shell hook had nothing to re-queue it. Re-running is idempotent (the
+    title rewritten, union of tags); an empty answer is not a failure and is
+    never retried (homelab#1563).
     """
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
@@ -178,7 +177,7 @@ def enrich_document_task(
             queue_id = enrich.resolve_queue_tag(client, paperless_url)
         result = enrich.enrich_document(
             client, paperless_url, document_id, queue_id, dry_run=dry_run,
-            mode=mode, tag_vocabulary=tag_vocabulary, sample=sample,
+            tag_vocabulary=tag_vocabulary, sample=sample,
         )
 
     enrich.append_result(result)
@@ -230,7 +229,6 @@ def enrich_flow(document_id: int) -> None:
 def enrich_sweep_flow(
     batch_size: int | None = None,
     dry_run: bool = False,
-    mode: str | None = None,
     document_ids: list[int] | None = None,
 ) -> None:
     """Enrich documents still carrying the `queue` tag.
@@ -244,17 +242,16 @@ def enrich_sweep_flow(
     Because a dry run leaves `queue` in place, it re-reads the same documents every
     time — it is a sample, not a pass over the library.
 
-    `mode` overrides ENRICH_MODE for this run, and `document_ids` replaces the
-    `queue` query with a fixed list, enriched whether or not it still carries
-    `queue` and even past a curated title (dry-run only). Together they are the homelab#1563 gate: the same
-    sample dry-run once per mode, then `python -m document_pipeline compare`.
+    `document_ids` replaces the `queue` query with a fixed list, enriched
+    whether or not it still carries `queue` and even past a curated title
+    (dry-run only) — how a prompt change is compared on the same sample
+    (homelab#1563).
     """
     logger = get_run_logger()
     flow_started = time.perf_counter()
     slot_acquired = False
     if document_ids and not dry_run:
         raise ValueError("document_ids re-enriches processed documents and needs dry_run=true")
-    mode = enrich.resolve_mode(mode)
     if batch_size is None:
         batch_size = int(os.environ.get("ENRICH_SWEEP_BATCH_SIZE", "20"))
 
@@ -265,7 +262,7 @@ def enrich_sweep_flow(
         # whatever this run does not reach, the next hour picks up.
         with concurrency("enrich-sweep", occupy=1, timeout_seconds=10):
             slot_acquired = True
-            _run_sweep(batch_size, dry_run, mode, document_ids)
+            _run_sweep(batch_size, dry_run, document_ids)
         logger.info("enrich-sweep complete in %.2fs", time.perf_counter() - flow_started)
     except TimeoutError:
         if not slot_acquired:
@@ -274,9 +271,7 @@ def enrich_sweep_flow(
             raise
 
 
-def _run_sweep(
-    batch_size: int, dry_run: bool, mode: str, sample_ids: list[int] | None = None
-) -> None:
+def _run_sweep(batch_size: int, dry_run: bool, sample_ids: list[int] | None = None) -> None:
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     tag_vocabulary = None
@@ -286,13 +281,14 @@ def _run_sweep(
             document_ids = [int(d) for d in sample_ids]
         else:
             document_ids = enrich.find_unenriched(client, paperless_url, queue_id, batch_size)
-        if mode == "extract":
-            # Once per run, not per document (homelab#1563).
+        if document_ids:
+            # Once per run, not per document (homelab#1563) — and not at all on
+            # the usual empty hourly run.
             tag_vocabulary = enrich.fetch_tag_vocabulary(client, paperless_url)
 
     logger.info(
-        "enrich-sweep: %d %s document(s), batch size %d, mode %s%s",
-        len(document_ids), "sampled" if sample_ids else "unenriched", batch_size, mode,
+        "enrich-sweep: %d %s document(s), batch size %d%s",
+        len(document_ids), "sampled" if sample_ids else "unenriched", batch_size,
         " (DRY RUN — nothing will be written)" if dry_run else "",
     )
     enriched = failed = 0
@@ -301,7 +297,7 @@ def _run_sweep(
             with concurrency("ollama", occupy=1):
                 enrich_document_task(
                     document_id, queue_id, dry_run,
-                    mode=mode, tag_vocabulary=tag_vocabulary, sample=bool(sample_ids),
+                    tag_vocabulary=tag_vocabulary, sample=bool(sample_ids),
                 )
             enriched += 1
         except Exception as exc:

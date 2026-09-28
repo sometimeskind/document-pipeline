@@ -1,8 +1,8 @@
 """Tests for document_pipeline.enrich — the behaviours the shell hook never had.
 
-The tag-union, the empty-title bail, the short-content skip and the PATCH payload
-shape were all untested shell in post-consume.sh. They are the reason this moved
-into Python, so they are what these tests pin down.
+The tag-union, the short-content skip and the PATCH payload shape were all
+untested shell in post-consume.sh. They are the reason this moved into Python,
+so they are what these tests pin down.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _records(path):
 
 
 def _client():
-    return enrich.open_client("tok", suggest_timeout=5.0)
+    return enrich.open_client("tok")
 
 
 def _mock_document(
@@ -57,24 +57,6 @@ def _mock_document(
                 "tags": list(tags),
                 "original_file_name": original,
                 "correspondent": correspondent,
-            },
-        )
-    )
-
-
-def _mock_suggestions(
-    *, title="Invoice from Hermes", tags=(5,), suggested_tags=("shipping",),
-    correspondents=(), suggested_correspondents=(),
-):
-    return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/ai_suggestions/").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "title": title,
-                "tags": list(tags),
-                "suggested_tags": list(suggested_tags),
-                "correspondents": list(correspondents),
-                "suggested_correspondents": list(suggested_correspondents),
             },
         )
     )
@@ -134,82 +116,7 @@ def test_normalize_title_truncates_to_the_column_width():
     assert len(enrich.normalize_title("a" * 300)) == enrich.MAX_TITLE_CHARS
 
 
-# --- enrich_document ---
-
-@respx.mock
-def test_patch_payload_carries_the_title_and_the_unioned_tags_without_queue():
-    _mock_document(tags=(3, QUEUE_ID))
-    _mock_suggestions(tags=(5,))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "enriched"
-    assert json.loads(patch.calls.last.request.content) == {
-        "tags": [3, 5],
-        "title": "Invoice from Hermes",
-    }
-
-
-@respx.mock
-def test_the_trigger_path_enriches_a_document_that_never_got_queue():
-    """A UI upload can dodge the workflow; the trigger must not require the tag."""
-    _mock_document(tags=(3,))
-    suggestions = _mock_suggestions(tags=(5,))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "enriched"
-    assert suggestions.called
-    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
-
-
-@respx.mock
-def test_queue_matched_by_the_model_is_still_stripped():
-    """Convergence is applied last, so it wins over the matched tags."""
-    _mock_document(tags=(3, QUEUE_ID))
-    _mock_suggestions(tags=(5, QUEUE_ID))
-    patch = _mock_patch()
-
-    _enrich()
-
-    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
-
-
-@respx.mock
-def test_suggested_tags_are_recorded_but_never_applied():
-    """Applying unmatched names would let the LLM grow the vocabulary per document."""
-    _mock_document(tags=())
-    _mock_suggestions(tags=(5,), suggested_tags=("shipping", "hermes"))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.suggested_tags == ["shipping", "hermes"]
-    assert json.loads(patch.calls.last.request.content)["tags"] == [5]
-
-
 # --- the before-state record (#1562): what `rollback` replays ---
-
-@respx.mock
-def test_an_enriched_result_carries_the_before_and_after_state():
-    _mock_document(tags=(3, QUEUE_ID), title="scan_0042", correspondent=None)
-    _mock_suggestions(tags=(5,), correspondents=(8,))
-    respx.get(f"{PAPERLESS}/api/correspondents/8/").mock(
-        return_value=httpx.Response(200, json={"id": 8, "name": "Hermes"})
-    )
-    _mock_patch()
-
-    result = _enrich()
-
-    assert result.previous_title == "scan_0042"
-    assert result.previous_tags == [3, QUEUE_ID]
-    assert result.previous_correspondent is None
-    # The after-state as ids, so rollback can tell whether anyone edited since.
-    assert result.tags == [3, 5]
-    assert result.correspondent_id == 8
-
 
 @respx.mock
 def test_a_tags_only_write_carries_the_before_state_too():
@@ -224,55 +131,6 @@ def test_a_tags_only_write_carries_the_before_state_too():
     )
 
 
-@respx.mock
-def test_the_record_is_written_before_the_patch(results_path):
-    """A crash mid-PATCH must leave evidence: the intent is on disk first."""
-    _mock_document(tags=(3,))
-    _mock_suggestions(tags=(5,))
-    seen_at_patch_time = []
-
-    def respond(request):
-        seen_at_patch_time.extend(_records(results_path))
-        return httpx.Response(200, json={"id": DOC_ID})
-
-    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(side_effect=respond)
-
-    _enrich()
-
-    assert len(seen_at_patch_time) == 1
-    record = seen_at_patch_time[0]
-    assert record["outcome"] == enrich.PENDING_OUTCOME
-    assert record["document_id"] == DOC_ID
-    assert record["previous_title"] == "scan_0042"
-    assert record["previous_tags"] == [3]
-    assert record["title"] == "Invoice from Hermes"
-    assert record["tags"] == [3, 5]
-
-
-@respx.mock
-def test_a_failed_patch_still_leaves_the_pending_record(results_path):
-    _mock_document(tags=(3,))
-    _mock_suggestions(tags=(5,))
-    respx.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
-        return_value=httpx.Response(500)
-    )
-
-    with pytest.raises(httpx.HTTPStatusError):
-        _enrich()
-
-    assert [r["outcome"] for r in _records(results_path)] == [enrich.PENDING_OUTCOME]
-
-
-@respx.mock
-def test_a_dry_run_writes_no_pending_record(results_path):
-    _mock_document(tags=(3,))
-    _mock_suggestions(tags=(5,))
-
-    _enrich(dry_run=True)
-
-    assert _records(results_path) == []
-
-
 # --- correspondents (#1363) ---
 
 OLLAMA = "http://ollama"
@@ -283,353 +141,13 @@ def _fallback_env(monkeypatch, url=OLLAMA, model="qwen-test"):
     monkeypatch.setenv("ENRICH_OLLAMA_MODEL", model)
 
 
-def _mock_ollama(name="symbox", title="Factuur van Hermes"):
-    """Serve both dedicated queries — they POST the same /api/chat and are only
-    distinguishable by which field their schema requires."""
-    def respond(request):
-        field = json.loads(request.content)["format"]["required"][0]
-        value = title if field == "title" else name
-        return httpx.Response(
-            200, json={"message": {"content": json.dumps({field: value})}}
+def _mock_ollama(name="symbox"):
+    """Serve the backfill's correspondent query."""
+    return respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(
+            200, json={"message": {"content": json.dumps({"correspondent": name})}}
         )
-
-    return respx.post(f"{OLLAMA}/api/chat").mock(side_effect=respond)
-
-
-# --- the #1366 fallback: paperless's own pass reliably suggests nothing ---
-
-@respx.mock
-def test_fallback_asks_ollama_when_paperless_suggests_nothing(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document()
-    _mock_suggestions()  # no correspondents, no suggested_correspondents
-    ollama = _mock_ollama("Cloudflare")
-    _mock_correspondent_search(results=())
-    create = _mock_correspondent_create(correspondent_id=31)
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    request = json.loads(ollama.calls.last.request.content)
-    assert request["model"] == "qwen-test"
-    assert request["format"]["required"] == ["correspondent"]
-    assert json.loads(create.calls.last.request.content) == {"name": "Cloudflare", "owner": None}
-    assert json.loads(patch.calls.last.request.content)["correspondent"] == 31
-    assert result.correspondent == "Cloudflare"
-
-
-@respx.mock
-def test_fallback_sends_capped_content(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document(content="x" * 5000)
-    _mock_suggestions()
-    ollama = _mock_ollama("")
-    _mock_patch()
-
-    _enrich()
-
-    prompt = json.loads(ollama.calls.last.request.content)["messages"][0]["content"]
-    assert prompt.endswith("x" * enrich.FALLBACK_CONTENT_CHARS)
-    assert "x" * (enrich.FALLBACK_CONTENT_CHARS + 1) not in prompt
-
-
-@respx.mock
-def test_fallback_empty_string_means_no_correspondent(monkeypatch):
-    """The required field lets the model decline; an invented blank must not create."""
-    _fallback_env(monkeypatch)
-    _mock_document()
-    _mock_suggestions()
-    _mock_ollama("")
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "enriched"
-    assert result.correspondent is None
-    assert "correspondent" not in json.loads(patch.calls.last.request.content)
-
-
-@respx.mock
-def test_fallback_is_not_consulted_when_paperless_suggested_a_name(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document()
-    _mock_suggestions(suggested_correspondents=("symbox",))
-    ollama = _mock_ollama()
-    _mock_correspondent_search(results=())
-    _mock_correspondent_create()
-    _mock_patch()
-
-    result = _enrich()
-
-    assert result.correspondent == "symbox"
-    # Only the title query reached ollama — no correspondent query fired.
-    fields = [json.loads(c.request.content)["format"]["required"] for c in ollama.calls]
-    assert fields == [["title"]]
-
-
-@respx.mock
-def test_fallback_failure_never_costs_the_title(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document()
-    _mock_suggestions()
-    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "enriched"
-    assert result.correspondent is None
-    assert json.loads(patch.calls.last.request.content)["title"] == "Invoice from Hermes"
-
-
-@respx.mock
-def test_fallback_is_off_when_unconfigured(monkeypatch):
-    """No env vars, no ollama call — the image can land before the manifest."""
-    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
-    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
-    _mock_document()
-    _mock_suggestions()
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.correspondent is None
-    assert "correspondent" not in json.loads(patch.calls.last.request.content)
-
-
-# --- the #43 dedicated title query: paperless's prompt has no language pin ---
-# Documents are mocked with a correspondent so that path stays out of the way.
-
-@respx.mock
-def test_title_comes_from_the_dedicated_query_not_the_suggestions(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document(correspondent=1)
-    _mock_suggestions(title="Invoice from Hermes")
-    ollama = _mock_ollama(title="Factuur van Hermes")
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    request = json.loads(ollama.calls.last.request.content)
-    assert request["format"]["required"] == ["title"]
-    assert "never translate the title" in request["messages"][0]["content"]
-    assert json.loads(patch.calls.last.request.content)["title"] == "Factuur van Hermes"
-    assert result.title == "Factuur van Hermes"
-
-
-@respx.mock
-def test_title_falls_back_to_suggestions_when_unconfigured(monkeypatch):
-    """Pre-#43 behavior when the env is absent — the image can land before the manifest."""
-    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
-    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
-    _mock_document(correspondent=1)
-    _mock_suggestions()
-    _mock_patch()
-
-    result = _enrich()
-
-    assert result.title == "Invoice from Hermes"
-
-
-@respx.mock
-def test_title_query_failure_falls_back_to_suggestions(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document(correspondent=1)
-    _mock_suggestions()
-    respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "enriched"
-    assert json.loads(patch.calls.last.request.content)["title"] == "Invoice from Hermes"
-
-
-@respx.mock
-def test_title_query_sends_capped_content(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document(content="x" * 5000, correspondent=1)
-    _mock_suggestions()
-    ollama = _mock_ollama()
-    _mock_patch()
-
-    _enrich()
-
-    prompt = json.loads(ollama.calls.last.request.content)["messages"][0]["content"]
-    assert prompt.endswith("x" * enrich.FALLBACK_CONTENT_CHARS)
-    assert "x" * (enrich.FALLBACK_CONTENT_CHARS + 1) not in prompt
-
-
-@respx.mock
-def test_empty_title_from_both_sources_raises(monkeypatch):
-    _fallback_env(monkeypatch)
-    _mock_document(correspondent=1)
-    _mock_suggestions(title="")
-    _mock_ollama(title="")
-    patch = _mock_patch()
-
-    with pytest.raises(ValueError):
-        _enrich()
-
-    assert not patch.calls
-
-
-@respx.mock
-def test_title_and_correspondent_queries_both_fire(monkeypatch):
-    """One extra query each, title first — the whole budget of #42 plus #43."""
-    _fallback_env(monkeypatch)
-    _mock_document()
-    _mock_suggestions(title="")
-    ollama = _mock_ollama(name="Cloudflare", title="Factuur maart")
-    _mock_correspondent_search(results=())
-    _mock_correspondent_create(correspondent_id=31)
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    fields = [json.loads(c.request.content)["format"]["required"] for c in ollama.calls]
-    assert fields == [["title"], ["correspondent"]]
-    payload = json.loads(patch.calls.last.request.content)
-    assert payload["title"] == "Factuur maart"
-    assert payload["correspondent"] == 31
-    assert result.correspondent == "Cloudflare"
-
-@respx.mock
-def test_a_suggested_correspondent_is_created_unowned_and_assigned():
-    """The `owner: None` in the create payload is the #1292 rule: an owned
-    correspondent is invisible to paperless's matching on other users' documents."""
-    _mock_document()
-    _mock_suggestions(suggested_correspondents=("symbox",))
-    _mock_correspondent_search(results=())
-    create = _mock_correspondent_create(correspondent_id=17)
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert json.loads(create.calls.last.request.content) == {"name": "symbox", "owner": None}
-    assert json.loads(patch.calls.last.request.content)["correspondent"] == 17
-    assert result.correspondent == "symbox"
-
-
-@respx.mock
-def test_an_existing_correspondent_is_reused_rather_than_duplicated():
-    """A replayed trigger after a failed PATCH must find its own earlier create."""
-    _mock_document()
-    _mock_suggestions(suggested_correspondents=("symbox",))
-    _mock_correspondent_search(results=({"id": 21, "name": "Symbox"},))
-    patch = _mock_patch()
-
-    _enrich()
-
-    assert json.loads(patch.calls.last.request.content)["correspondent"] == 21
-
-
-@respx.mock
-def test_a_matched_correspondent_id_wins_over_a_suggested_name():
-    _mock_document()
-    _mock_suggestions(correspondents=(7,), suggested_correspondents=("Symbox GmbH & Co",))
-    respx.get(f"{PAPERLESS}/api/correspondents/7/").mock(
-        return_value=httpx.Response(200, json={"id": 7, "name": "Symbox"})
     )
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert json.loads(patch.calls.last.request.content)["correspondent"] == 7
-    assert result.correspondent == "Symbox"
-
-
-@respx.mock
-def test_an_existing_assignment_is_never_overwritten():
-    """However a correspondent got onto the document, it outranks the LLM."""
-    _mock_document(correspondent=4)
-    _mock_suggestions(correspondents=(7,), suggested_correspondents=("symbox",))
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert "correspondent" not in json.loads(patch.calls.last.request.content)
-    assert result.correspondent is None
-
-
-@respx.mock
-def test_dry_run_reports_the_correspondent_without_creating_it():
-    """No search, no POST — respx would raise on any unmocked correspondent call."""
-    _mock_document()
-    _mock_suggestions(suggested_correspondents=("symbox",))
-
-    result = _enrich(dry_run=True)
-
-    assert result.outcome == "dry-run"
-    assert result.correspondent == "symbox"
-
-
-@respx.mock
-def test_short_content_skips_the_llm_and_only_strips_queue():
-    """Schema-constrained generation always emits a title, so a blank scan would
-    get an invented one. Skip it, but converge it so the sweep stops re-picking it."""
-    _mock_document(content="too short", tags=(3, QUEUE_ID))
-    suggestions = _mock_suggestions()
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "skipped-short-content"
-    assert result.title is None
-    assert not suggestions.called
-    assert json.loads(patch.calls.last.request.content) == {"tags": [3]}
-
-
-@respx.mock
-def test_short_content_without_queue_writes_nothing():
-    """Nothing to converge, so no PATCH — and no pointless filename re-render."""
-    _mock_document(content="too short", tags=(3,))
-    patch = _mock_patch()
-
-    assert _enrich().outcome == "skipped-short-content"
-    assert not patch.called
-
-
-@respx.mock
-def test_empty_llm_title_raises_rather_than_patching():
-    _mock_document()
-    _mock_suggestions(title="   ")
-    patch = _mock_patch()
-
-    with pytest.raises(ValueError, match="empty title"):
-        _enrich()
-
-    assert not patch.called
-
-
-@respx.mock
-def test_a_replayed_trigger_on_an_enriched_document_is_a_cheap_no_op():
-    """No `queue` and an enriched title: the curated-title check makes it free —
-    no LLM call and no write."""
-    _mock_document(tags=(3,), title="Invoice from Hermes")
-    suggestions = _mock_suggestions()
-    patch = _mock_patch()
-
-    result = _enrich()
-
-    assert result.outcome == "skipped-curated-title"
-    assert not suggestions.called
-    assert not patch.called
-
-
-@respx.mock
-def test_a_suggestions_failure_propagates_so_prefect_can_retry():
-    """The 503 that used to cost a document its title permanently."""
-    _mock_document()
-    respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/ai_suggestions/").mock(
-        return_value=httpx.Response(503)
-    )
-    patch = _mock_patch()
-
-    with pytest.raises(httpx.HTTPStatusError):
-        _enrich()
-
-    assert not patch.called
 
 
 # --- find_unenriched ---
@@ -675,7 +193,7 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
     # Stamped at write time, in UTC — what `rollback --since` filters on.
     recorded_at = datetime.fromisoformat(first.pop("recorded_at"))
     assert recorded_at.utcoffset() == timedelta(0)
-    # A superset check: the #1563 gate fields are pinned in their own test.
+    # A superset check: the #1563 fields are pinned in their own test.
     assert first.items() >= {
         "document_id": DOC_ID,
         "outcome": "enriched",
@@ -692,18 +210,16 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
     }.items()
 
 
-def test_append_result_records_the_gate_fields(tmp_path):
-    """Mode and pass count are what the #1563 comparison reads back."""
+def test_append_result_records_the_pass_count_and_created(tmp_path):
     target = tmp_path / "results.jsonl"
     enrich.append_result(
-        enrich.EnrichResult(document_id=DOC_ID, outcome="dry-run", mode="extract",
-                            model_passes=1, created="2026-09-01",
+        enrich.EnrichResult(document_id=DOC_ID, outcome="dry-run",
+                            model_passes=2, created="2026-09-01",
                             created_proposed="2026-09-01"),
         path=str(target),
     )
     record = json.loads(target.read_text(encoding="utf-8"))
-    assert record["mode"] == "extract"
-    assert record["model_passes"] == 1
+    assert record["model_passes"] == 2
     assert record["created"] == "2026-09-01"
     assert record["created_proposed"] == "2026-09-01"
 
@@ -748,33 +264,16 @@ def test_a_document_with_no_original_filename_is_enriched_rather_than_skipped():
 @respx.mock
 def test_a_curated_title_is_converged_but_never_retitled():
     _mock_document(title="Geburtsurkunde", original="upload_kMvk1i.pdf", tags=(3, QUEUE_ID))
-    suggestions = _mock_suggestions()
     patch = _mock_patch()
 
-    result = _enrich()
+    result = _enrich()  # respx refuses any unmocked call: no model query at all
 
     assert result.outcome == "skipped-curated-title"
-    assert not suggestions.called  # costs no LLM call at all
     # Converged, so the sweep stops instead of re-reading it every hour forever.
     assert json.loads(patch.calls.last.request.content) == {"tags": [3]}
 
 
 # --- dry run: the review pass that must not be able to write ---
-
-@respx.mock
-def test_dry_run_reports_the_title_without_patching_anything():
-    _mock_document(tags=(3,))
-    _mock_suggestions(tags=(5,), suggested_tags=("shipping",))
-    patch = _mock_patch()
-
-    result = _enrich(dry_run=True)
-
-    assert result.outcome == "dry-run"
-    assert result.title == "Invoice from Hermes"
-    assert result.matched_tags == [5]
-    assert result.suggested_tags == ["shipping"]
-    assert not patch.called
-
 
 @respx.mock
 def test_dry_run_does_not_converge_a_curated_document():
@@ -1054,7 +553,7 @@ def test_find_without_correspondent_queries_enriched_unmarked_documents():
     assert params["ordering"] == "id"
 
 
-# --- ENRICH_MODE=extract: one structured query per document (homelab#1563) ---
+# --- enrich_document: a title query and a facts query (homelab#1563) ---
 
 
 TODAY = date(2026, 9, 25)
@@ -1065,7 +564,6 @@ VOCAB = {"invoice": 5, "shipping": 6, "insurance": 7}
 
 def _extract_env(monkeypatch):
     _fallback_env(monkeypatch)
-    monkeypatch.setenv("ENRICH_MODE", "extract")
 
 
 def _mock_extract_document(
@@ -1136,30 +634,6 @@ def _extract(*, dry_run=False, vocab=VOCAB, sample=False):
             client, PAPERLESS, DOC_ID, QUEUE_ID, dry_run=dry_run,
             tag_vocabulary=vocab, sample=sample,
         )
-
-
-# mode selection
-
-def test_mode_defaults_to_suggest(monkeypatch):
-    monkeypatch.delenv("ENRICH_MODE", raising=False)
-    assert enrich.resolve_mode(None) == "suggest"
-
-
-def test_mode_comes_from_the_environment(monkeypatch):
-    monkeypatch.setenv("ENRICH_MODE", "extract")
-    assert enrich.resolve_mode(None) == "extract"
-
-
-def test_an_explicit_mode_outranks_the_environment(monkeypatch):
-    """A flow-run parameter can dry-run the other path without an env change."""
-    monkeypatch.setenv("ENRICH_MODE", "extract")
-    assert enrich.resolve_mode("suggest") == "suggest"
-
-
-def test_an_unknown_mode_is_rejected_rather_than_silently_defaulted(monkeypatch):
-    monkeypatch.setenv("ENRICH_MODE", "extarct")
-    with pytest.raises(ValueError):
-        enrich.resolve_mode(None)
 
 
 # tag matching against a fixed vocabulary
@@ -1244,20 +718,19 @@ def test_created_accepts_a_datetime_shaped_created_field():
     ) == "2026-09-01"
 
 
-# enrich_document in extract mode
+# enrich_document
 
 @respx.mock
-def test_extract_mode_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeypatch):
+def test_enrich_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeypatch):
+    """respx refuses any unmocked call, ai_suggestions included."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
-    suggestions = _mock_suggestions()
     ollama = _mock_extraction(tags=("invoice", "Tax return"))
     _mock_correspondent_search(results=({"id": 17},))
     patch = _mock_patch()
 
     result = _extract()
 
-    assert not suggestions.called
     # The title is asked alone, with the default path's prompt (#43); the facts
     # query carries no title at all (#1563: four fields at once lost titles).
     assert _chat_schemas(ollama) == [["title"], ["correspondent", "tags", "created"]]
@@ -1270,7 +743,6 @@ def test_extract_mode_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeyp
         "created": "2026-09-01",
     }
     assert result.outcome == "enriched"
-    assert result.mode == "extract"
     assert result.model_passes == 2
     assert result.matched_tags == [5]
     assert result.suggested_tags == ["Tax return"]
@@ -1279,7 +751,7 @@ def test_extract_mode_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeyp
 
 
 @respx.mock
-def test_extract_mode_never_creates_a_tag(monkeypatch):
+def test_enrich_never_creates_a_tag(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction(tags=("brand new tag",))
@@ -1297,7 +769,7 @@ def test_extract_mode_never_creates_a_tag(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_fetches_the_vocabulary_when_not_handed_one(monkeypatch):
+def test_enrich_fetches_the_vocabulary_when_not_handed_one(monkeypatch):
     """The trigger path enriches one document per run, so it fetches its own."""
     _extract_env(monkeypatch)
     _mock_extract_document()
@@ -1313,7 +785,7 @@ def test_extract_mode_fetches_the_vocabulary_when_not_handed_one(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_leaves_a_created_date_paperless_found_alone(monkeypatch):
+def test_enrich_leaves_a_created_date_paperless_found_alone(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(created="2025-03-14")
     _mock_extraction(created="2026-09-01")
@@ -1328,7 +800,7 @@ def test_extract_mode_leaves_a_created_date_paperless_found_alone(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_never_overwrites_an_existing_correspondent(monkeypatch):
+def test_enrich_never_overwrites_an_existing_correspondent(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(correspondent=4)
     _mock_extraction()
@@ -1343,7 +815,7 @@ def test_extract_mode_never_overwrites_an_existing_correspondent(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_creates_a_new_correspondent_unowned(monkeypatch):
+def test_enrich_creates_a_new_correspondent_unowned(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction(correspondent="Cloudflare")
@@ -1358,7 +830,7 @@ def test_extract_mode_creates_a_new_correspondent_unowned(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_empty_title_leaves_the_title_alone_and_writes_the_rest(monkeypatch):
+def test_enrich_empty_title_leaves_the_title_alone_and_writes_the_rest(monkeypatch):
     """An empty answer is the model saying "nothing here", not a failure: the
     #1563 gate lost 8/10 documents to retrying one. The other fields still land."""
     _extract_env(monkeypatch)
@@ -1377,7 +849,7 @@ def test_extract_mode_empty_title_leaves_the_title_alone_and_writes_the_rest(mon
 
 
 @respx.mock
-def test_extract_mode_empty_facts_leave_their_fields_alone(monkeypatch):
+def test_enrich_empty_facts_leave_their_fields_alone(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
     _mock_extraction(correspondent=" ", tags=(), created="")
@@ -1394,7 +866,7 @@ def test_extract_mode_empty_facts_leave_their_fields_alone(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_all_fields_empty_still_converges(monkeypatch):
+def test_enrich_all_fields_empty_still_converges(monkeypatch):
     """Nothing to write but `queue` goes, so the sweep stops re-reading it."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
@@ -1409,7 +881,7 @@ def test_extract_mode_all_fields_empty_still_converges(monkeypatch):
 
 @respx.mock
 @pytest.mark.parametrize("tags", [None, "invoice", {"name": "invoice"}, [None, 7, ""]])
-def test_extract_mode_malformed_tags_leave_the_tags_alone(monkeypatch, tags):
+def test_enrich_malformed_tags_leave_the_tags_alone(monkeypatch, tags):
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
     _mock_extraction(tags=tags)
@@ -1423,7 +895,7 @@ def test_extract_mode_malformed_tags_leave_the_tags_alone(monkeypatch, tags):
 
 
 @respx.mock
-def test_extract_mode_invalid_created_leaves_created_alone(monkeypatch):
+def test_enrich_invalid_created_leaves_created_alone(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction(created="sometime in September")
@@ -1439,8 +911,8 @@ def test_extract_mode_invalid_created_leaves_created_alone(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_raises_on_an_ollama_failure(monkeypatch):
-    """No ai_suggestions to fall back to — the task retry is the fallback."""
+def test_enrich_raises_on_an_ollama_failure(monkeypatch):
+    """Nothing to fall back to — the task retry is the fallback."""
     _extract_env(monkeypatch)
     _mock_extract_document()
     respx.post(f"{OLLAMA}/api/chat").mock(return_value=httpx.Response(500))
@@ -1453,7 +925,7 @@ def test_extract_mode_raises_on_an_ollama_failure(monkeypatch):
 
 @respx.mock
 @pytest.mark.parametrize("failing", ["title_status", "facts_status"])
-def test_extract_mode_raises_when_either_query_fails(monkeypatch, failing):
+def test_enrich_raises_when_either_query_fails(monkeypatch, failing):
     """Unlike the default path's degrading title query: a failed call must not
     read as an empty answer, or a timeout would converge a document untitled."""
     _extract_env(monkeypatch)
@@ -1467,7 +939,7 @@ def test_extract_mode_raises_when_either_query_fails(monkeypatch, failing):
 
 
 @respx.mock
-def test_extract_mode_raises_on_an_unparseable_answer(monkeypatch):
+def test_enrich_raises_on_an_unparseable_answer(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     respx.post(f"{OLLAMA}/api/chat").mock(
@@ -1481,7 +953,7 @@ def test_extract_mode_raises_on_an_unparseable_answer(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_strips_a_legal_suffix_from_the_correspondent(monkeypatch):
+def test_enrich_strips_a_legal_suffix_from_the_correspondent(monkeypatch):
     """The 3B model kept "GmbH" despite the prompt in the #1563 gate run."""
     _extract_env(monkeypatch)
     _mock_extract_document()
@@ -1504,7 +976,7 @@ _ECHOED_CORRESPONDENT = (
 
 
 @respx.mock
-def test_extract_mode_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch):
+def test_enrich_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch):
     """An echo would otherwise be created as a correspondent on a live run."""
     _extract_env(monkeypatch)
     _mock_extract_document()
@@ -1522,7 +994,7 @@ def test_extract_mode_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch
 
 
 @respx.mock
-def test_extract_mode_rejects_a_title_that_echoes_the_prompt(monkeypatch):
+def test_enrich_rejects_a_title_that_echoes_the_prompt(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction(title="Write a short descriptive title for this document.")
@@ -1596,8 +1068,7 @@ def test_strip_legal_suffixes_leaves_other_names_alone(name):
 
 
 @respx.mock
-def test_extract_mode_raises_when_ollama_is_unconfigured(monkeypatch):
-    monkeypatch.setenv("ENRICH_MODE", "extract")
+def test_enrich_raises_when_ollama_is_unconfigured(monkeypatch):
     monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
     monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
     _mock_extract_document()
@@ -1609,7 +1080,7 @@ def test_extract_mode_raises_when_ollama_is_unconfigured(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_sends_capped_content(monkeypatch):
+def test_enrich_sends_capped_content(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(content="x" * 5000)
     ollama = _mock_extraction()
@@ -1624,7 +1095,7 @@ def test_extract_mode_sends_capped_content(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_dry_run_writes_nothing(monkeypatch):
+def test_enrich_dry_run_writes_nothing(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction(correspondent="Cloudflare", tags=("invoice", "tax"))
@@ -1637,7 +1108,6 @@ def test_extract_mode_dry_run_writes_nothing(monkeypatch):
     assert not patch.called
     assert not create.called
     assert result.outcome == "dry-run"
-    assert result.mode == "extract"
     assert result.title == "Factuur van Hermes"
     assert result.matched_tags == [5]
     assert result.suggested_tags == ["tax"]
@@ -1646,7 +1116,7 @@ def test_extract_mode_dry_run_writes_nothing(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_short_content_skips_the_query(monkeypatch):
+def test_enrich_short_content_skips_the_query(monkeypatch):
     _extract_env(monkeypatch)
     _mock_extract_document(content="too short")
     ollama = _mock_extraction()
@@ -1659,10 +1129,41 @@ def test_extract_mode_short_content_skips_the_query(monkeypatch):
     assert result.model_passes == 0
 
 
-# extract mode records the before-state like the default path (#1562)
+@respx.mock
+def test_the_trigger_path_enriches_a_document_that_never_got_queue(monkeypatch):
+    """A UI upload can dodge the workflow; the trigger must not require the tag."""
+    _extract_env(monkeypatch)
+    _mock_extract_document(tags=(3,))
+    _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract()
+
+    assert result.outcome == "enriched"
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
+
 
 @respx.mock
-def test_extract_mode_writes_the_pending_record_before_the_patch(monkeypatch, results_path):
+def test_an_existing_correspondent_is_reused_rather_than_duplicated(monkeypatch):
+    """A replayed trigger after a failed PATCH must find its own earlier create."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    _mock_extraction(correspondent="Symbox")
+    _mock_correspondent_search(results=({"id": 21, "name": "Symbox"},))
+    create = _mock_correspondent_create()
+    patch = _mock_patch()
+
+    _extract()
+
+    assert not create.called
+    assert json.loads(patch.calls.last.request.content)["correspondent"] == 21
+
+
+# the before-state record for a write (#1562)
+
+@respx.mock
+def test_enrich_writes_the_pending_record_before_the_patch(monkeypatch, results_path):
     """Same crash-safety as the default path, plus `created`, which only extract writes."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3,), created="2026-09-20")
@@ -1680,7 +1181,6 @@ def test_extract_mode_writes_the_pending_record_before_the_patch(monkeypatch, re
 
     [record] = seen_at_patch_time
     assert record["outcome"] == enrich.PENDING_OUTCOME
-    assert record["mode"] == "extract"
     assert record["previous_title"] == "scan_0042"
     assert record["previous_tags"] == [3]
     assert record["previous_correspondent"] is None
@@ -1697,7 +1197,7 @@ def test_extract_mode_writes_the_pending_record_before_the_patch(monkeypatch, re
 
 
 @respx.mock
-def test_extract_mode_failed_patch_still_leaves_the_pending_record(monkeypatch, results_path):
+def test_enrich_failed_patch_still_leaves_the_pending_record(monkeypatch, results_path):
     _extract_env(monkeypatch)
     _mock_extract_document()
     _mock_extraction()
@@ -1713,7 +1213,7 @@ def test_extract_mode_failed_patch_still_leaves_the_pending_record(monkeypatch, 
 
 
 @respx.mock
-def test_extract_mode_dry_run_carries_the_before_state_but_writes_no_record(
+def test_enrich_dry_run_carries_the_before_state_but_writes_no_record(
     monkeypatch, results_path
 ):
     _extract_env(monkeypatch)
@@ -1731,7 +1231,7 @@ def test_extract_mode_dry_run_carries_the_before_state_but_writes_no_record(
 
 
 @respx.mock
-def test_extract_mode_converges_through_converged_tags(monkeypatch):
+def test_enrich_converges_through_converged_tags(monkeypatch):
     """One place decides what "converged" looks like (#1561), extract path included."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3,))
@@ -1747,7 +1247,7 @@ def test_extract_mode_converges_through_converged_tags(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_strips_queue_even_when_the_model_names_it(monkeypatch):
+def test_enrich_strips_queue_even_when_the_model_names_it(monkeypatch):
     """`queue` is never matched in from the model, and always stripped (#1561)."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3, QUEUE_ID))
@@ -1764,7 +1264,7 @@ def test_extract_mode_strips_queue_even_when_the_model_names_it(monkeypatch):
 
 
 @respx.mock
-def test_extract_mode_strips_queue_from_a_matched_tag_that_slipped_through(monkeypatch):
+def test_enrich_strips_queue_from_a_matched_tag_that_slipped_through(monkeypatch):
     """Belt and braces: converged_tags runs last, after the union with the matches."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3,))
@@ -1779,44 +1279,11 @@ def test_extract_mode_strips_queue_from_a_matched_tag_that_slipped_through(monke
     assert result.tags == [3, 5]
 
 
-# the default path records its pass count too, so the gate can compare
-
-@respx.mock
-def test_suggest_mode_records_its_model_passes(monkeypatch):
-    _fallback_env(monkeypatch)
-    monkeypatch.delenv("ENRICH_MODE", raising=False)
-    _mock_document()
-    _mock_suggestions()  # no correspondent -> the fallback query fires too
-    _mock_ollama("Cloudflare")
-    _mock_correspondent_search(results=())
-    _mock_correspondent_create()
-    _mock_patch()
-
-    result = _enrich()
-
-    # ai_suggestions (classification + localization) + title + correspondent
-    assert result.mode == "suggest"
-    assert result.model_passes == 4
-
-
-@respx.mock
-def test_suggest_mode_pass_count_without_the_dedicated_queries(monkeypatch):
-    monkeypatch.delenv("ENRICH_MODE", raising=False)
-    monkeypatch.delenv("ENRICH_OLLAMA_URL", raising=False)
-    monkeypatch.delenv("ENRICH_OLLAMA_MODEL", raising=False)
-    _mock_document()
-    _mock_suggestions(suggested_correspondents=("Hermes",))
-    _mock_correspondent_search(results=({"id": 17},))
-    _mock_patch()
-
-    assert _enrich().model_passes == 2
-
-
-# sample: dry-run re-enrichment of already-enriched documents for the gate
+# sample: dry-run re-enrichment of already-enriched documents (#1563)
 
 @respx.mock
 def test_sample_reenriches_a_converged_curated_document_on_a_dry_run(monkeypatch):
-    """No `queue` left and a curated title: exactly the gate's sample documents."""
+    """No `queue` left and a curated title: exactly what a comparison samples."""
     _extract_env(monkeypatch)
     _mock_extract_document(tags=(3,), title="Factuur", original="scan.pdf",
                            correspondent=4)
@@ -1828,26 +1295,7 @@ def test_sample_reenriches_a_converged_curated_document_on_a_dry_run(monkeypatch
     assert ollama.called
     assert not patch.called
     assert result.outcome == "dry-run"
-    # The existing assignment is reported past, so the gate can compare answers.
-    assert result.correspondent == "Hermes"
-
-
-@respx.mock
-def test_sample_in_suggest_mode_reenriches_too(monkeypatch):
-    monkeypatch.delenv("ENRICH_MODE", raising=False)
-    _fallback_env(monkeypatch)
-    _mock_document(tags=(3,), title="Factuur", correspondent=4)
-    _mock_suggestions()
-    _mock_ollama("Hermes")
-    patch = _mock_patch()
-
-    with _client() as client:
-        result = enrich.enrich_document(
-            client, PAPERLESS, DOC_ID, QUEUE_ID, dry_run=True, sample=True
-        )
-
-    assert not patch.called
-    assert result.outcome == "dry-run"
+    # The existing assignment is reported past, so answers can be compared.
     assert result.correspondent == "Hermes"
 
 
@@ -1855,31 +1303,3 @@ def test_sample_refuses_to_write():
     with _client() as client:
         with pytest.raises(ValueError):
             enrich.enrich_document(client, PAPERLESS, DOC_ID, QUEUE_ID, sample=True)
-
-
-# the gate comparison over the JSONL
-
-def test_compare_modes_pairs_the_latest_dry_run_of_each_mode(tmp_path):
-    path = _write_results(tmp_path, [
-        {"document_id": 1, "outcome": "dry-run", "mode": "suggest", "title": "old",
-         "correspondent": "Hermes", "matched_tags": [], "suggested_tags": ["x"],
-         "model_passes": 4, "duration_seconds": 90.0},
-        {"document_id": 1, "outcome": "dry-run", "mode": "suggest", "title": "Invoice",
-         "correspondent": "Hermes", "matched_tags": [5], "suggested_tags": [],
-         "model_passes": 4, "duration_seconds": 100.0},
-        {"document_id": 1, "outcome": "dry-run", "mode": "extract", "title": "Factuur",
-         "correspondent": "hermes", "matched_tags": [5, 6], "suggested_tags": [],
-         "model_passes": 1, "duration_seconds": 30.0, "created": "2026-09-01"},
-        {"document_id": 2, "outcome": "dry-run", "mode": "extract", "title": "Lonely",
-         "model_passes": 1, "duration_seconds": 20.0},
-        {"document_id": 3, "outcome": "enriched", "mode": "suggest", "title": "Live"},
-        {"document_id": 4, "outcome": "dry-run", "title": "pre-1563 record"},
-    ])
-
-    pairs = enrich.compare_modes(path)
-
-    assert [p["document_id"] for p in pairs] == [1]
-    pair = pairs[0]
-    assert pair["suggest"]["title"] == "Invoice"
-    assert pair["extract"]["title"] == "Factuur"
-    assert pair["correspondent_agrees"] is True  # case-insensitive

@@ -107,7 +107,7 @@ def _day(value) -> str | None:
 
 
 def _writes_created(record: dict) -> bool:
-    """Only extract mode writes `created` (#1563), and only when pick_created allowed it."""
+    """Only enrichment since #1563 writes `created`, and only when pick_created allowed it."""
     return record.get("created") is not None and record.get("previous_created") is not None
 
 
@@ -229,7 +229,7 @@ def revert_document(
 
     # Sent whole, correspondent included: None here means "clear it", unlike
     # patch_document where it means "leave it alone". `created` is in it only
-    # when the record wrote it (extract mode, #1563).
+    # when the record wrote it (#1563).
     resp = client.patch(f"{paperless_url}/api/documents/{document_id}/", json=target)
     resp.raise_for_status()
     enrich.append_result(
