@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _PREFECT_FILTER_URL = "{url}/flow_runs/filter"
 
 
-def _prefect_failures_24h(prefect_url: str, flow_name: str = "mail") -> int | None:
+def _prefect_failures_24h(prefect_url: str, flow_name: str) -> int | None:
     """Return count of failed/crashed runs of the named flow in the last 24 h, or None on error."""
     import datetime
 
@@ -81,16 +81,6 @@ def push_run_metrics(
         registry=registry,
     ).set(duration_seconds)
 
-    prefect_url = os.environ.get("PREFECT_API_URL", "")
-    if prefect_url:
-        failures = _prefect_failures_24h(prefect_url)
-        if failures is not None:
-            Gauge(
-                "document_pipeline_prefect_failures_24h",
-                "Number of failed/crashed mail Prefect flow runs in the last 24 hours",
-                registry=registry,
-            ).set(failures)
-
     _push(url, "mail-pipeline", registry)
 
 
@@ -101,7 +91,7 @@ def push_failure_metrics() -> None:
     this is half a group, and replacing the whole `mail-pipeline` group here
     would wipe `document_pipeline_last_success_timestamp` — the one gauge that
     says how long the pipeline has been stalled. The success path still PUTs,
-    so a run that recovers clears these again and an alert on them resolves.
+    so a run that recovers clears it again and an alert on it resolves.
 
     A failing run deliberately pushes no `last_success_timestamp`: leaving it
     frozen is the point. Paired with a moving `last_failure_timestamp`, that is
@@ -119,21 +109,6 @@ def push_failure_metrics() -> None:
         "Unix timestamp of the last failed mail-pipeline run",
         registry=registry,
     ).set(time.time())
-
-    prefect_url = os.environ.get("PREFECT_API_URL", "")
-    if prefect_url:
-        failures = _prefect_failures_24h(prefect_url)
-        if failures is not None:
-            gauge = Gauge(
-                "document_pipeline_prefect_failures_24h",
-                "Number of failed/crashed mail Prefect flow runs in the last 24 hours",
-                registry=registry,
-            )
-            # Plus this run: it is still Running while this pushes, so the query
-            # counting FAILED and CRASHED runs cannot see it yet, and the first
-            # failure after a quiet day would otherwise publish 0 — the exact
-            # reading that made the #58 outage look like an idle pipeline.
-            gauge.set(failures + 1)
 
     _pushadd(url, "mail-pipeline", registry)
 

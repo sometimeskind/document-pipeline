@@ -46,14 +46,9 @@ def test_run_level_gauges_stay_unlabelled(monkeypatch):
     assert registry.get_sample_value("scan_pipeline_last_success_timestamp") > 0
 
 
-def _pushed_failure(monkeypatch, prefect_failures=None):
+def _pushed_failure(monkeypatch):
     monkeypatch.setenv("PUSHGATEWAY_URL", "http://pushgateway:9091")
-    if prefect_failures is None:
-        monkeypatch.delenv("PREFECT_API_URL", raising=False)
-    else:
-        monkeypatch.setenv("PREFECT_API_URL", "http://prefect:4200/api")
-    with patch("document_pipeline.metrics.pushadd_to_gateway") as pushadd, \
-         patch("document_pipeline.metrics._prefect_failures_24h", return_value=prefect_failures):
+    with patch("document_pipeline.metrics.pushadd_to_gateway") as pushadd:
         metrics.push_failure_metrics()
     assert pushadd.call_args.kwargs["job"] == "mail-pipeline"
     return pushadd.call_args.kwargs["registry"]
@@ -72,7 +67,6 @@ def test_the_failure_push_adds_to_the_group_rather_than_replacing_it(monkeypatch
     """A PUT here would wipe `last_success_timestamp` — the very gauge that
     says how long the pipeline has been stalled."""
     monkeypatch.setenv("PUSHGATEWAY_URL", "http://pushgateway:9091")
-    monkeypatch.delenv("PREFECT_API_URL", raising=False)
 
     with patch("document_pipeline.metrics.pushadd_to_gateway") as pushadd, \
          patch("document_pipeline.metrics.push_to_gateway") as push:
@@ -82,26 +76,21 @@ def test_the_failure_push_adds_to_the_group_rather_than_replacing_it(monkeypatch
     push.assert_not_called()
 
 
-def test_the_failure_count_includes_the_run_that_is_pushing_it(monkeypatch):
-    """That run is still Running, so the FAILED/CRASHED query cannot see it —
-    without the increment the first failure of the day would publish 0."""
-    registry = _pushed_failure(monkeypatch, prefect_failures=2)
-
-    assert registry.get_sample_value("document_pipeline_prefect_failures_24h") == 3
-
-
-def test_a_successful_run_publishes_the_queried_failure_count_unchanged(monkeypatch):
-    """The success path keeps replacing the whole group with the queried value,
-    which is also what clears the failure gauges once a run recovers."""
+def test_a_successful_run_replaces_the_group_without_a_failure_timestamp(monkeypatch):
+    """The success path replaces the whole group, which is what clears the
+    failure gauge once a run recovers. Failed-run counts are the Prefect
+    exporter's job (homelab#1838), so the mail group carries none and the
+    push makes no Prefect API call."""
     monkeypatch.setenv("PUSHGATEWAY_URL", "http://pushgateway:9091")
     monkeypatch.setenv("PREFECT_API_URL", "http://prefect:4200/api")
 
     with patch("document_pipeline.metrics.push_to_gateway") as push, \
-         patch("document_pipeline.metrics._prefect_failures_24h", return_value=2):
+         patch("document_pipeline.metrics._prefect_failures_24h") as query:
         metrics.push_run_metrics(3, 4, duration_seconds=1.5)
 
     registry = push.call_args.kwargs["registry"]
     assert push.call_args.kwargs["job"] == "mail-pipeline"
-    assert registry.get_sample_value("document_pipeline_prefect_failures_24h") == 2
+    assert registry.get_sample_value("document_pipeline_prefect_failures_24h") is None
+    query.assert_not_called()
     assert registry.get_sample_value("document_pipeline_emails_synced") == 3
     assert registry.get_sample_value("document_pipeline_last_failure_timestamp") is None
