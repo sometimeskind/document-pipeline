@@ -93,9 +93,8 @@ def mail_flow() -> None:
                 messages_processed, pdfs_submitted = process_mail_task()
             except Exception:
                 # A Failed run must still say so in Prometheus. Pushing nothing
-                # freezes `document_pipeline_last_success_timestamp` and leaves
-                # `..._prefect_failures_24h` at 0, so a pipeline failing every
-                # run reads exactly like an idle one — which is how #58 ran 43
+                # freezes `document_pipeline_last_success_timestamp`, so a
+                # pipeline failing every run reads exactly like an idle one — which is how #58 ran 43
                 # hours unnoticed (#60). Shaped like enrich_flow's failure push.
                 push_failure_metrics_task()
                 raise

@@ -26,15 +26,15 @@ that fails is left in `mail/` and alerted on, instead of being a 2xx the mail
 flow took for done.
 
 A run that ends `Failed` still reports. `push_failure_metrics` POSTs
-`document_pipeline_last_failure_timestamp`, and a
-`document_pipeline_prefect_failures_24h` that counts the still-Running failing
-run the Prefect query cannot yet see, into the same `mail-pipeline` group —
+`document_pipeline_last_failure_timestamp` into the same `mail-pipeline` group —
 POST, not PUT, so `document_pipeline_last_success_timestamp` stays frozen at
 the last good run instead of being wiped. A stale success next to a fresh
 failure is what distinguishes "runs are failing" from "no new mail"; before
 #60 a failing run published nothing at all, so the two read identically and
 #58 ran 43 hours unnoticed. The success path still replaces the whole group,
-which is what clears the failure gauges once a run recovers.
+which is what clears the failure gauge once a run recovers. Counting failed
+runs is left to the homelab's Prefect exporter (`PrefectDeploymentFailing`,
+homelab#1838), which sees every deployment's flow-run state directly.
 
 `mbsync` is **bidirectional**. New mail flows down from Proton; local changes (deletes, moves, flag/Seen changes made by a mail client through Dovecot) flow back up. A single long-running container runs a Prefect flow on event-driven triggers from the cluster (with a cron-backstop) and exposes a small HTTP API for health probes and on-demand triggers — see [Trigger architecture](#trigger-architecture).
 
