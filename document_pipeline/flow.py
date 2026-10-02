@@ -313,7 +313,7 @@ def _run_sweep(batch_size: int, dry_run: bool, sample_ids: list[int] | None = No
     name="backfill-correspondent", retries=2, retry_delay_seconds=[60, 300], log_prints=True
 )
 def backfill_correspondent_task(
-    document_id: int, declined_id: int, dry_run: bool = False
+    document_id: int, declined_id: int, dry_run: bool = False, sample: bool = False
 ) -> enrich.EnrichResult:
     """Assign a correspondent to one already-enriched document, or mark it declined.
 
@@ -325,7 +325,7 @@ def backfill_correspondent_task(
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
         result = enrich.backfill_correspondent(
-            client, paperless_url, document_id, declined_id, dry_run=dry_run
+            client, paperless_url, document_id, declined_id, dry_run=dry_run, sample=sample
         )
 
     enrich.append_result(result)
@@ -337,7 +337,11 @@ def backfill_correspondent_task(
 
 
 @flow(name="correspondent-backfill", log_prints=True)
-def correspondent_backfill_flow(batch_size: int | None = None, dry_run: bool = False) -> None:
+def correspondent_backfill_flow(
+    batch_size: int | None = None,
+    dry_run: bool = False,
+    document_ids: list[int] | None = None,
+) -> None:
     """Assign correspondents to enriched documents that have none (#1373).
 
     Shaped like enrich_sweep_flow, over the complementary set: documents that
@@ -349,17 +353,24 @@ def correspondent_backfill_flow(batch_size: int | None = None, dry_run: bool = F
     Same memory budget as the sweep (see ENRICH_SWEEP_BATCH_SIZE in the cluster
     manifest): its cron is offset from the sweep's so each batch runs against a
     freshly loaded model, and the `ollama` slot serializes any overlap.
+
+    `document_ids` replaces the query with a fixed list, asked even past an
+    existing correspondent or the `no-correspondent` marker (dry-run only) —
+    how a prompt change is compared on the same sample, as in the sweep
+    (homelab#1863).
     """
     logger = get_run_logger()
     flow_started = time.perf_counter()
     slot_acquired = False
+    if document_ids and not dry_run:
+        raise ValueError("document_ids re-asks processed documents and needs dry_run=true")
     if batch_size is None:
         batch_size = int(os.environ.get("CORRESPONDENT_BACKFILL_BATCH_SIZE", "8"))
 
     try:
         with concurrency("correspondent-backfill", occupy=1, timeout_seconds=10):
             slot_acquired = True
-            _run_backfill(batch_size, dry_run)
+            _run_backfill(batch_size, dry_run, document_ids)
         logger.info(
             "correspondent-backfill complete in %.2fs", time.perf_counter() - flow_started
         )
@@ -370,25 +381,31 @@ def correspondent_backfill_flow(batch_size: int | None = None, dry_run: bool = F
             raise
 
 
-def _run_backfill(batch_size: int, dry_run: bool) -> None:
+def _run_backfill(batch_size: int, dry_run: bool, sample_ids: list[int] | None = None) -> None:
     logger = get_run_logger()
     paperless_url = os.environ["PAPERLESS_URL"]
     with enrich.open_client(_paperless_admin_token()) as client:
-        queue_id = enrich.resolve_queue_tag(client, paperless_url)
         declined_id = enrich.resolve_declined_tag(client, paperless_url)
-        document_ids = enrich.find_without_correspondent(
-            client, paperless_url, queue_id, declined_id, batch_size
-        )
+        if sample_ids:
+            document_ids = [int(d) for d in sample_ids]
+        else:
+            queue_id = enrich.resolve_queue_tag(client, paperless_url)
+            document_ids = enrich.find_without_correspondent(
+                client, paperless_url, queue_id, declined_id, batch_size
+            )
 
     logger.info(
-        "correspondent-backfill: %d document(s) without a correspondent, batch size %d%s",
-        len(document_ids), batch_size, " (DRY RUN — nothing will be written)" if dry_run else "",
+        "correspondent-backfill: %d %s document(s), batch size %d%s",
+        len(document_ids), "sampled" if sample_ids else "without a correspondent", batch_size,
+        " (DRY RUN — nothing will be written)" if dry_run else "",
     )
     assigned = declined = failed = 0
     for document_id in document_ids:
         try:
             with concurrency("ollama", occupy=1):
-                result = backfill_correspondent_task(document_id, declined_id, dry_run)
+                result = backfill_correspondent_task(
+                    document_id, declined_id, dry_run, sample=bool(sample_ids)
+                )
         except Exception as exc:
             # Per-document isolation, as in the sweep — and nothing is marked
             # on failure, so the next run asks again.
