@@ -310,6 +310,17 @@ Two things differ from the sweep, and both exist because here the correspondent
   retries, the document stays unmarked, and a run that lost its whole batch fails
   rather than finishing `Completed`.
 
+`correspondent-backfill` takes `document_ids` too, on the same terms as the
+sweep's: dry-run only, and the listed documents are asked even past an existing
+correspondent or the `no-correspondent` marker, so a `CORRESPONDENT_PROMPT`
+change can be compared on the same set (homelab#1863):
+
+```bash
+kubectl exec -n mail deploy/document-pipeline -- \
+  prefect deployment run correspondent-backfill/correspondent-backfill \
+  -p dry_run=true -p document_ids='[101,102,103]'
+```
+
 Each PATCH renames the file to the `<created>_<correspondent>_<title>` format,
 which is the point — and also why the cron is offset from the sweep's and
 batched to the same memory budget: it is a slow rolling rename over the

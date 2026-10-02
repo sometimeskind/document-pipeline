@@ -914,6 +914,7 @@ def backfill_correspondent(
     declined_id: int,
     *,
     dry_run: bool = False,
+    sample: bool = False,
 ) -> EnrichResult:
     """Assign a correspondent to one already-enriched document, or mark it declined.
 
@@ -927,11 +928,17 @@ def backfill_correspondent(
 
     `dry_run` reports the name without creating or writing anything, and so
     re-reports the same documents every time — a sample, as in the sweep.
+
+    `sample` asks past an existing correspondent, for comparing a prompt change
+    on a fixed set of documents (homelab#1863), and is dry-run only, as in
+    enrich_document.
     """
     started = time.perf_counter()
+    if sample and not dry_run:
+        raise ValueError("sample re-asks processed documents and is dry-run only")
 
     document = fetch_document(client, paperless_url, document_id)
-    if document.get("correspondent") is not None:
+    if document.get("correspondent") is not None and not sample:
         # The sweep or a hand edit got there between the query and now.
         logger.info("Document %s already has a correspondent, skipping", document_id)
         return EnrichResult(

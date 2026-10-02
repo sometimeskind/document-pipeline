@@ -611,6 +611,53 @@ def test_backfill_passes_dry_run_through_to_every_document(monkeypatch):
         assert [c.args for c in mock_task.call_args_list] == [(1, 11, True), (2, 11, True)]
 
 
+def test_backfill_samples_named_documents_on_a_dry_run(monkeypatch):
+    """A prompt comparison: the same ids, whatever their state, on a dry run (homelab#1863)."""
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency") as mock_concurrency:
+        mock_concurrency.return_value.__enter__.return_value = None
+        mock_concurrency.return_value.__exit__.return_value = False
+        mock_enrich.resolve_declined_tag.return_value = 11
+        mock_task.side_effect = [_backfill_result(21), _backfill_result(22)]
+
+        correspondent_backfill_flow(dry_run=True, document_ids=[21, 22])
+
+        mock_enrich.find_without_correspondent.assert_not_called()
+        assert [c.args for c in mock_task.call_args_list] == [(21, 11, True), (22, 11, True)]
+        assert all(c.kwargs["sample"] is True for c in mock_task.call_args_list)
+
+
+def test_backfill_refuses_a_live_sample(monkeypatch):
+    _enrich_env(monkeypatch)
+    from document_pipeline.flow import correspondent_backfill_flow
+
+    with patch("document_pipeline.flow.enrich"), \
+         patch("document_pipeline.flow.backfill_correspondent_task") as mock_task, \
+         patch("document_pipeline.flow.concurrency"):
+        with pytest.raises(ValueError):
+            correspondent_backfill_flow(document_ids=[21])
+        mock_task.assert_not_called()
+
+
+def test_backfill_task_passes_sample_through(monkeypatch):
+    from document_pipeline.flow import backfill_correspondent_task
+    _enrich_env(monkeypatch)
+
+    with patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.get_run_logger"):
+        mock_enrich.backfill_correspondent.return_value = _backfill_result(42)
+
+        backfill_correspondent_task.fn(42, 11, True, sample=True)
+
+        assert mock_enrich.backfill_correspondent.call_args.kwargs == {
+            "dry_run": True, "sample": True
+        }
+
+
 def test_paperless_health_flow_probes_with_the_admin_token_and_pushes(monkeypatch):
     from document_pipeline.flow import paperless_health_flow
     from document_pipeline.paperless_health import TaskQueueHealth

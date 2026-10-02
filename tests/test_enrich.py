@@ -363,10 +363,10 @@ def test_rank_suggested_tags_ignores_the_pre_patch_record(tmp_path):
 DECLINED_ID = 11
 
 
-def _backfill(*, dry_run=False):
+def _backfill(*, dry_run=False, sample=False):
     with _client() as client:
         return enrich.backfill_correspondent(
-            client, PAPERLESS, DOC_ID, DECLINED_ID, dry_run=dry_run
+            client, PAPERLESS, DOC_ID, DECLINED_ID, dry_run=dry_run, sample=sample
         )
 
 
@@ -531,6 +531,28 @@ def test_backfill_dry_run_does_not_mark_a_declined_document(monkeypatch):
 
     assert result.outcome == "declined"
     assert not patch.called
+
+
+@respx.mock
+def test_backfill_sample_asks_past_an_existing_correspondent(monkeypatch):
+    """A prompt comparison re-asks documents that already have one (homelab#1863)."""
+    _fallback_env(monkeypatch)
+    _mock_document(tags=(7,), correspondent=4)
+    ollama = _mock_ollama("Cloudflare")
+    patch = _mock_patch()
+
+    result = _backfill(dry_run=True, sample=True)
+
+    assert ollama.called
+    assert not patch.called
+    assert result.outcome == "dry-run"
+    assert result.correspondent == "Cloudflare"
+
+
+def test_backfill_sample_refuses_to_write():
+    with _client() as client:
+        with pytest.raises(ValueError):
+            enrich.backfill_correspondent(client, PAPERLESS, DOC_ID, DECLINED_ID, sample=True)
 
 
 @respx.mock
