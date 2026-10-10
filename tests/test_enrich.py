@@ -168,7 +168,7 @@ def test_find_unenriched_queries_on_the_presence_of_queue():
     assert params["ordering"] == "id"
 
 
-# --- the JSONL harvest artifact ---
+# --- the results JSONL ---
 
 def test_append_result_writes_one_json_object_per_line(tmp_path):
     target = tmp_path / "nested" / "results.jsonl"
@@ -178,7 +178,6 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
             outcome="enriched",
             title="Invoice from Hermes",
             matched_tags=[5],
-            suggested_tags=["shipping"],
             duration_seconds=1.5,
         ),
         path=str(target),
@@ -199,7 +198,6 @@ def test_append_result_writes_one_json_object_per_line(tmp_path):
         "outcome": "enriched",
         "title": "Invoice from Hermes",
         "matched_tags": [5],
-        "suggested_tags": ["shipping"],
         "correspondent": None,
         "duration_seconds": 1.5,
         "previous_title": None,
@@ -292,70 +290,6 @@ def test_dry_run_does_not_converge_a_short_content_document():
 
     assert _enrich(dry_run=True).outcome == "skipped-short-content"
     assert not patch.called
-
-
-# --- the vocabulary harvest ---
-
-def _write_results(tmp_path, records):
-    target = tmp_path / "results.jsonl"
-    target.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
-    return str(target)
-
-
-def test_rank_suggested_tags_ranks_by_document_count(tmp_path):
-    path = _write_results(tmp_path, [
-        {"document_id": 1, "suggested_tags": ["invoice", "shipping"]},
-        {"document_id": 2, "suggested_tags": ["invoice"]},
-        {"document_id": 3, "suggested_tags": ["invoice", "tax"]},
-    ])
-
-    documents, ranked = enrich.rank_suggested_tags(path)
-
-    assert documents == 3
-    assert ranked == [("invoice", 3), ("shipping", 1), ("tax", 1)]
-
-
-def test_rank_suggested_tags_groups_spellings_the_way_paperless_matches(tmp_path):
-    """paperless_ai.matching case-folds before comparing, so ranking must too —
-    otherwise one tag splits across two entries and neither looks worth creating."""
-    path = _write_results(tmp_path, [
-        {"document_id": 1, "suggested_tags": ["Invoice"]},
-        {"document_id": 2, "suggested_tags": ["invoice"]},
-        {"document_id": 3, "suggested_tags": ["Invoice"]},
-    ])
-
-    _, ranked = enrich.rank_suggested_tags(path)
-
-    assert ranked == [("Invoice", 3)]  # most common spelling reported
-
-
-def test_rank_suggested_tags_counts_a_repeated_name_once_per_document(tmp_path):
-    path = _write_results(tmp_path, [{"document_id": 1, "suggested_tags": ["tax", "tax"]}])
-
-    assert enrich.rank_suggested_tags(path)[1] == [("tax", 1)]
-
-
-def test_rank_suggested_tags_survives_a_torn_final_line(tmp_path):
-    """A pod killed mid-write must not cost the whole harvest."""
-    target = tmp_path / "results.jsonl"
-    target.write_text(
-        json.dumps({"document_id": 1, "suggested_tags": ["invoice"]}) + "\n{\"document_",
-        encoding="utf-8",
-    )
-
-    assert enrich.rank_suggested_tags(str(target)) == (1, [("invoice", 1)])
-
-
-def test_rank_suggested_tags_ignores_the_pre_patch_record(tmp_path):
-    """The pending record repeats the final one; counting both would double every name."""
-    path = _write_results(tmp_path, [
-        {"document_id": 1, "outcome": enrich.PENDING_OUTCOME, "suggested_tags": ["tax"]},
-        {"document_id": 1, "outcome": "enriched", "suggested_tags": ["tax"]},
-        {"document_id": 2, "outcome": "enriched", "suggested_tags": ["tax"]},
-    ])
-
-    assert enrich.rank_suggested_tags(path) == (2, [("tax", 2)])
-
 
 
 # --- the correspondent backfill (#1373) ---
@@ -766,10 +700,73 @@ def test_enrich_is_a_title_and_a_facts_query_and_no_ai_suggestions(monkeypatch):
     }
     assert result.outcome == "enriched"
     assert result.model_passes == 2
-    assert result.matched_tags == [5]
-    assert result.suggested_tags == ["Tax return"]
+    assert result.matched_tags == [5]  # "Tax return" is not in the vocabulary
     assert result.correspondent == "Hermes"
     assert result.created == "2026-09-01"
+
+
+def _facts_request(route) -> dict:
+    """The facts query's request body: the last /api/chat call."""
+    return json.loads(route.calls.last.request.content)
+
+
+@respx.mock
+def test_enrich_constrains_tags_to_the_vocabulary(monkeypatch):
+    """A closed set (homelab#1804): the enum and the prompt carry the same names."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    ollama = _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    _mock_patch()
+
+    _extract()
+
+    body = _facts_request(ollama)
+    assert body["format"]["properties"]["tags"] == {
+        "type": "array",
+        "items": {"type": "string", "enum": ["insurance", "invoice", "shipping"]},
+    }
+    prompt = body["messages"][0]["content"]
+    assert "this is: insurance, invoice, shipping." in prompt
+    assert "{tags}" not in prompt and "{names}" not in prompt
+
+
+@respx.mock
+def test_enrich_offers_neither_queue_nor_the_decline_tag(monkeypatch):
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    ollama = _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    _mock_patch()
+
+    _extract(vocab={**VOCAB, enrich.QUEUE_TAG: QUEUE_ID, enrich.NO_CORRESPONDENT_TAG: 11})
+
+    enum = _facts_request(ollama)["format"]["properties"]["tags"]["items"]["enum"]
+    assert enum == ["insurance", "invoice", "shipping"]
+
+
+@respx.mock
+def test_enrich_without_a_vocabulary_does_not_ask_for_tags(monkeypatch):
+    """An empty enum would leave the model no valid item, so the field goes."""
+    _extract_env(monkeypatch)
+    _mock_extract_document()
+    ollama = _mock_extraction(tags=("invoice",))
+    _mock_correspondent_search(results=({"id": 17},))
+    patch = _mock_patch()
+
+    result = _extract(vocab={enrich.QUEUE_TAG: QUEUE_ID})
+
+    body = _facts_request(ollama)
+    assert body["format"]["required"] == ["correspondent", "created"]
+    assert "tags" not in body["format"]["properties"]
+    assert "tags:" not in body["messages"][0]["content"]
+    assert json.loads(patch.calls.last.request.content)["tags"] == [3]
+    assert result.matched_tags == []
+
+
+def test_facts_prompt_survives_braces_in_a_tag_name():
+    prompt = enrich.facts_prompt(["a{b}", "{0}"])
+    assert "a{b}, {0}." in prompt
 
 
 @respx.mock
@@ -787,7 +784,7 @@ def test_enrich_never_creates_a_tag(monkeypatch):
 
     assert not create_tag.called
     assert json.loads(patch.calls.last.request.content)["tags"] == [3]
-    assert result.suggested_tags == ["brand new tag"]
+    assert result.matched_tags == []
 
 
 @respx.mock
@@ -1313,7 +1310,6 @@ def test_enrich_dry_run_writes_nothing(monkeypatch):
     assert result.outcome == "dry-run"
     assert result.title == "Factuur van Hermes"
     assert result.matched_tags == [5]
-    assert result.suggested_tags == ["tax"]
     assert result.correspondent == "Cloudflare"
     assert result.created == "2026-09-01"
 
@@ -1463,7 +1459,6 @@ def test_enrich_strips_queue_even_when_the_model_names_it(monkeypatch):
     assert json.loads(patch.calls.last.request.content)["tags"] == [3, 5]
     assert result.tags == [3, 5]
     assert result.matched_tags == [5]
-    assert result.suggested_tags == []
 
 
 @respx.mock

@@ -198,9 +198,10 @@ never touched this service.
 
 Two details are load-bearing:
 
-- **Unmatched tag names are recorded, never applied.** Applying them would let the
-  model grow the tag vocabulary one document at a time. They go to the results
-  JSONL instead, which is what a vocabulary is curated from.
+- **Tags are a closed set** (homelab#1804). The model may only answer with names of
+  tags that already exist in paperless; it can never grow the vocabulary. New tags
+  are created by hand in paperless, unowned (#1292) and with matching *None* so
+  paperless's own auto-matching stays out of it.
 - **Ollama work is held in a `concurrency("ollama", occupy=1)` slot** with no
   timeout. Unlike the mail and scan slots, a busy slot must *queue* here: those
   flows drain a source wholesale so a skipped run is covered by the next one, but
@@ -221,8 +222,8 @@ Two things exist for the backfill specifically:
   freshly consumed document always compares equal, so this never fires on the
   first trigger for a document.
 - **`dry_run=true` writes nothing** — no PATCH, so `queue` stays, no filename
-  rename and no state change. It reports the proposed title and the unmatched names
-  to the results JSONL for review. Because `queue` stays it re-reads the same
+  rename and no state change. It reports the proposed title, tags, correspondent
+  and date to the results JSONL for review. Because `queue` stays it re-reads the same
   documents every time: it is a sample, not a pass over the library. It is a
   flow-run parameter, not an env var, deliberately — the sweep's steady-state job
   is catching dropped triggers, and a dry-run default would silently disable it.
@@ -233,7 +234,7 @@ Enrichment used to go through paperless's `ai_suggestions` and cost four model
 passes per document: two inside `ai_suggestions` (classification, then
 localization), a dedicated title query and a correspondent query. It now asks
 Ollama directly, **twice**: a title query, and one "facts" query whose schema
-requires `{correspondent, tags: [string], created}`. The rest is derived in code:
+requires `{correspondent, tags: [vocabulary name], created}`. The rest is derived in code:
 
 - **title** comes from its own query, with the document's language pinned (#43).
   Asked alongside the other fields, the 3B model gave up on it.
@@ -241,12 +242,17 @@ requires `{correspondent, tags: [string], created}`. The rest is derived in code
   trailing legal forms (GmbH, B.V., N.V., Inc., PBC, VVaG, AG, Ltd., "GmbH & Co.
   KG", …) are stripped in code as well. It is applied only when the document has
   none, and created unowned.
-- **tags** are matched against `/api/tags/`, fetched once per run,
-  case- and whitespace-insensitively against **existing** names only. Unmatched
-  names go to `suggested_tags` in the JSONL and are never applied or created —
-  the same rule `ai_suggestions` had, and what the `vocab` harvest reads. The
-  pipeline's own `queue` and `no-correspondent` are never matched, and the
-  written tag list goes through `converged_tags`, so `queue` is always stripped.
+- **tags** are picked from `/api/tags/`, fetched once per run, minus the
+  pipeline's own `queue` and `no-correspondent`. The names go into the schema as
+  an `enum` (Ollama enforces it in its grammar) and into the prompt as a list;
+  with no tags at all the field is dropped from the query rather than sent as an
+  empty enum. Answers are still matched case- and whitespace-insensitively
+  against **existing** names, so a name that slips past the grammar is logged
+  and ignored, never created. The written tag list goes through
+  `converged_tags`, so `queue` is always stripped. Free text was tried first and
+  harvested into the JSONL as `suggested_tags` (older records still carry it):
+  3,765 distinct names over 2,439 documents, split by language and half of them
+  correspondents, places or filler, which is why the set is closed.
 - **created** is written only when the model's answer is a real `YYYY-MM-DD`
   date, not in the future, and paperless's own `created` still equals the date
   the document was `added` — i.e. its date regex found nothing. A date
@@ -325,15 +331,6 @@ Each PATCH renames the file to the `<created>_<correspondent>_<title>` format,
 which is the point — and also why the cron is offset from the sweep's and
 batched to the same memory budget: it is a slow rolling rename over the
 library, paced by the `ollama` slot and the model's keep-alive.
-
-Harvest the vocabulary the corpus asked for from the results JSONL:
-
-```bash
-kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline vocab
-```
-
-Tagging cannot bootstrap itself — `match_tags` only matches tags that already
-exist — so those names have to be created before matching can ever fire.
 
 ### Rollback
 
