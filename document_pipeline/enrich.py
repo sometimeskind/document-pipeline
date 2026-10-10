@@ -636,7 +636,11 @@ def fetch_tag_vocabulary(client: httpx.Client, paperless_url: str) -> dict[str, 
 
 
 def tag_choices(vocabulary: dict[str, int]) -> list[str]:
-    """The names the facts query may answer with: every tag but the pipeline's own."""
+    """The names the facts query may answer with: every tag but the pipeline's own.
+
+    In the vocabulary's casefolded spelling ("DSL" is offered as "dsl"), so an
+    answer maps straight back to its id.
+    """
     return sorted(name for name in vocabulary if name not in _RESERVED_TAGS)
 
 
