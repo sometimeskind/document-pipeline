@@ -119,3 +119,23 @@ def test_api_errors_raise():
     respx.get(f"{PAPERLESS}/api/tasks/").mock(return_value=httpx.Response(403))
     with pytest.raises(httpx.HTTPStatusError):
         paperless_health.probe(PAPERLESS, "tok")
+
+
+@respx.mock
+def test_documents_added_since_reads_the_count_of_one_page():
+    since = datetime.datetime(2026, 10, 9, 6, 0, tzinfo=datetime.timezone.utc)
+    route = respx.get(f"{PAPERLESS}/api/documents/").mock(
+        return_value=httpx.Response(200, json={"count": 12, "next": "…", "results": [{"id": 1}]})
+    )
+    assert paperless_health.documents_added_since(PAPERLESS, "tok", since) == 12
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Token tok"
+    assert request.url.params["added__gte"] == "2026-10-09T06:00:00+00:00"
+    assert request.url.params["page_size"] == "1"
+
+
+@respx.mock
+def test_documents_added_since_raises_on_api_errors():
+    respx.get(f"{PAPERLESS}/api/documents/").mock(return_value=httpx.Response(403))
+    with pytest.raises(httpx.HTTPStatusError):
+        paperless_health.documents_added_since(PAPERLESS, "tok", datetime.datetime.now(datetime.timezone.utc))

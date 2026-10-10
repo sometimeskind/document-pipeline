@@ -8,7 +8,7 @@ so they are what these tests pin down.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -1506,3 +1506,33 @@ def test_sample_refuses_to_write():
     with _client() as client:
         with pytest.raises(ValueError):
             enrich.enrich_document(client, PAPERLESS, DOC_ID, QUEUE_ID, sample=True)
+
+
+# --- the digest's 24h enriched count (homelab#2014) ---
+
+def _record(document_id, outcome, hours_ago):
+    at = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return json.dumps({"recorded_at": at.isoformat(timespec="seconds"),
+                       "document_id": document_id, "outcome": outcome})
+
+
+def test_count_enriched_since_counts_distinct_enriched_documents_in_the_window(tmp_path):
+    target = tmp_path / "results.jsonl"
+    target.write_text("\n".join([
+        _record(1, "enriched", 30),        # before the window
+        _record(2, "pending", 2),          # the pre-PATCH record, repeated below
+        _record(2, "enriched", 2),
+        _record(3, "skipped-short-content", 2),
+        _record(4, "enriched", 1),
+        _record(4, "enriched", 1),         # a re-run counts once
+        _record(5, "dry-run", 1),
+        '{"recorded_at": "2026-10-',       # a torn final line
+    ]) + "\n", encoding="utf-8")
+
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    assert enrich.count_enriched_since(since, path=str(target)) == 2
+
+
+def test_count_enriched_since_is_zero_before_the_first_result(tmp_path):
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    assert enrich.count_enriched_since(since, path=str(tmp_path / "missing.jsonl")) == 0

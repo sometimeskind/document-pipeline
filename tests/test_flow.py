@@ -666,10 +666,38 @@ def test_paperless_health_flow_probes_with_the_admin_token_and_pushes(monkeypatc
     monkeypatch.setenv("PAPERLESS_ADMIN_TOKEN", "superuser-tok")
 
     with patch("document_pipeline.flow.paperless_health") as mock_probe, \
+         patch("document_pipeline.flow.enrich") as mock_enrich, \
          patch("document_pipeline.flow.metrics") as mock_metrics:
         mock_probe.probe.return_value = TaskQueueHealth(failed=2, oldest_unfinished_seconds=901.0)
+        mock_probe.documents_added_since.return_value = 7
+        mock_enrich.count_enriched_since.return_value = 3
 
         paperless_health_flow()
 
     mock_probe.probe.assert_called_once_with("http://paperless", "superuser-tok")
-    mock_metrics.push_paperless_health_metrics.assert_called_once_with(2, 901.0)
+    assert mock_probe.documents_added_since.call_args.args[:2] == ("http://paperless", "superuser-tok")
+    mock_metrics.push_paperless_health_metrics.assert_called_once_with(2, 901.0, 7, 3)
+
+
+@pytest.fixture
+def _health_env(monkeypatch):
+    monkeypatch.setenv("PAPERLESS_URL", "http://paperless")
+    monkeypatch.setenv("PAPERLESS_ADMIN_TOKEN", "superuser-tok")
+
+
+def test_paperless_health_flow_still_pushes_when_the_counts_fail(_health_env):
+    """The counts only feed the digest; the task-queue gauges and their
+    staleness alert must not depend on them."""
+    from document_pipeline.flow import paperless_health_flow
+    from document_pipeline.paperless_health import TaskQueueHealth
+
+    with patch("document_pipeline.flow.paperless_health") as mock_probe, \
+         patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.metrics") as mock_metrics:
+        mock_probe.probe.return_value = TaskQueueHealth(failed=0, oldest_unfinished_seconds=0.0)
+        mock_probe.documents_added_since.side_effect = RuntimeError("403")
+        mock_enrich.count_enriched_since.side_effect = PermissionError("/state")
+
+        paperless_health_flow()
+
+    mock_metrics.push_paperless_health_metrics.assert_called_once_with(0, 0.0, None, None)
