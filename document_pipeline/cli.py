@@ -33,35 +33,11 @@ _DEFAULT_SCAN_CRON = "0 * * * *"
 _DEFAULT_PAPERLESS_HEALTH_CRON = "*/5 * * * *"
 
 
-def _print_vocab() -> None:
-    """Frequency-ranked tag names the model proposed that matched nothing.
-
-    A subcommand (like `rollback`) because the data it reports on lives on a
-    PVC only this pod mounts. It is the #1280 harvesting step: tags
-    cannot bootstrap themselves, so the vocabulary has to be created before
-    matching can ever fire, and this is the only evidence of which names are
-    worth creating.
-
-        kubectl exec -n mail deploy/document-pipeline -- python -m document_pipeline vocab
-    """
-    from document_pipeline import enrich
-
-    try:
-        documents, ranked = enrich.rank_suggested_tags()
-    except FileNotFoundError:
-        logger.error("No enrich results yet — nothing has run.")
-        sys.exit(1)
-
-    print(f"{documents} document(s), {len(ranked)} distinct unmatched tag name(s)")
-    for name, count in ranked:
-        print(f"{count:6d}  {name}")
-
-
 def _rollback(argv: list[str]) -> None:
     """Replay the enrich before-state from the results JSONL (#1562).
 
-    Lives here for the same reason as `vocab`: the JSONL is on a PVC only this
-    pod mounts. Dry-run unless `--write`, like the rest of the pipeline.
+    A subcommand because the JSONL is on a PVC only this pod mounts. Dry-run
+    unless `--write`, like the rest of the pipeline.
 
         kubectl exec -n mail deploy/document-pipeline -- \\
             python -m document_pipeline rollback --since 2026-09-20T00:00:00Z
@@ -107,9 +83,6 @@ def _rollback(argv: list[str]) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "vocab":
-        _print_vocab()
-        return
     if len(sys.argv) > 1 and sys.argv[1] == "rollback":
         _rollback(sys.argv[2:])
         return
