@@ -45,7 +45,7 @@ homelab#1838), which sees every deployment's flow-run state directly.
 | `enrich` | none — trigger-driven | `enrich_document` → `push_enrich_metrics` |
 | `enrich-sweep` | `0 * * * *` (`ENRICH_SWEEP_CRON`) | `find_unenriched` → `enrich_document` per document |
 | `correspondent-backfill` | none unless `CORRESPONDENT_BACKFILL_CRON` | `find_without_correspondent` → `backfill_correspondent` per document |
-| `paperless-health` | `*/5 * * * *` (`PAPERLESS_HEALTH_CRON`) | `probe_paperless_health` → `push_paperless_health_metrics` |
+| `paperless-health` | `*/5 * * * *` (`PAPERLESS_HEALTH_CRON`) | `probe_paperless_health` → `count_documents_24h` → `push_paperless_health_metrics` |
 
 ## HTTP API (port `8080`)
 
@@ -407,6 +407,13 @@ admin token (the one with `view_paperlesstask`) and pushes, under the
 - `paperless_task_oldest_unfinished_seconds` — age of the oldest task of any
   type still `pending` or `started`, 0 when none.
 - `paperless_health_last_success_timestamp` — so a dead probe is itself loud.
+- `paperless_documents_consumed_24h` — documents whose `added` falls in the
+  last 24 hours (a page of one from `/api/documents/`).
+- `paperless_documents_enriched_24h` — distinct documents with an `enriched`
+  record in the enrich results JSONL (`ENRICH_RESULTS_PATH`) in the last 24 hours.
+
+The two 24h counts feed the homelab daily digest (homelab#2014). Each is left
+out of the push when it cannot be read, and never fails the flow.
 
 Two page-of-one queries (`count` for the first, `ordering=date_created` for
 the second) rather than a walk over the task list.

@@ -224,13 +224,23 @@ def push_enrich_metrics(document_id: int, succeeded: bool) -> None:
     _pushadd(url, "paperless_autotitle", registry)
 
 
-def push_paperless_health_metrics(failed: int, oldest_unfinished_seconds: float) -> None:
+def push_paperless_health_metrics(
+    failed: int,
+    oldest_unfinished_seconds: float,
+    consumed_24h: int | None = None,
+    enriched_24h: int | None = None,
+) -> None:
     """Push the task-queue probe (homelab#1589). No-op when PUSHGATEWAY_URL is unset.
 
     Its own job, replaced whole on every run like the mail and scan groups.
     The timestamp is what makes a dead probe loud: the other two gauges only
     ever say "fine" or "broken", so without it a probe that stopped running
     would look like a queue that stopped failing.
+
+    The two 24h counts ride along for the daily digest (homelab#2014). A count
+    that could not be read is left out rather than pushed as 0, as with
+    `scan_pipeline_prefect_failures_24h`: the digest then says "not available"
+    instead of reporting a quiet day.
     """
     url = os.environ.get("PUSHGATEWAY_URL", "")
     if not url:
@@ -255,6 +265,18 @@ def push_paperless_health_metrics(failed: int, oldest_unfinished_seconds: float)
         "Age of the oldest Paperless task still pending or started, 0 when none",
         registry=registry,
     ).set(oldest_unfinished_seconds)
+    if consumed_24h is not None:
+        Gauge(
+            "paperless_documents_consumed_24h",
+            "Number of documents Paperless consumed in the last 24 hours",
+            registry=registry,
+        ).set(consumed_24h)
+    if enriched_24h is not None:
+        Gauge(
+            "paperless_documents_enriched_24h",
+            "Number of documents the enrich flow retitled in the last 24 hours",
+            registry=registry,
+        ).set(enriched_24h)
 
     _push(url, "paperless-health", registry)
 

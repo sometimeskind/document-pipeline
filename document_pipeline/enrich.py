@@ -1101,3 +1101,35 @@ def rank_suggested_tags(path: str | None = None) -> tuple[int, list[tuple[str, i
         for name, count in counts.most_common()
     ]
     return len(documents), ranked
+
+
+def count_enriched_since(since: datetime, path: str | None = None) -> int:
+    """Documents with an `enriched` record written at or after `since`.
+
+    The daily digest's 24h count (homelab#2014), read off the same durable
+    JSONL rather than a pushgateway counter: a push replaces a value, so a
+    counter there would need a read-modify-write and would reset with the
+    pushgateway. Distinct document ids, so a re-run of the same document
+    counts once. No file yet means nothing has been enriched, not an error.
+    """
+    target = Path(path or os.environ.get("ENRICH_RESULTS_PATH", DEFAULT_RESULTS_PATH))
+    documents: set[int] = set()
+    try:
+        fh = target.open(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    with fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a torn final line, as in rank_suggested_tags
+            if record.get("outcome") != "enriched":
+                continue
+            try:
+                recorded = datetime.fromisoformat(record["recorded_at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if recorded >= since:
+                documents.add(record.get("document_id"))
+    return len(documents)

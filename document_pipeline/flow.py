@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import time
 
@@ -431,14 +432,45 @@ def probe_paperless_health_task() -> paperless_health.TaskQueueHealth:
     return paperless_health.probe(os.environ["PAPERLESS_URL"], _paperless_admin_token())
 
 
+@task(name="count-documents-24h", log_prints=True)
+def count_documents_24h_task() -> tuple[int | None, int | None]:
+    """Consumed and enriched counts for the daily digest (homelab#2014).
+
+    Each is None when it cannot be read, and never fails the flow: the
+    task-queue gauges and their staleness alert must not hang on a count
+    that only feeds a report.
+    """
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+    try:
+        consumed = paperless_health.documents_added_since(
+            os.environ["PAPERLESS_URL"], _paperless_admin_token(), since
+        )
+    except Exception as exc:
+        get_run_logger().warning("paperless-health: consumed count unavailable: %s", exc)
+        consumed = None
+    try:
+        enriched = enrich.count_enriched_since(since)
+    except Exception as exc:
+        get_run_logger().warning("paperless-health: enriched count unavailable: %s", exc)
+        enriched = None
+    return consumed, enriched
+
+
 @task(name="push-paperless-health-metrics", log_prints=True)
-def push_paperless_health_metrics_task(health: paperless_health.TaskQueueHealth) -> None:
-    metrics.push_paperless_health_metrics(health.failed, health.oldest_unfinished_seconds)
+def push_paperless_health_metrics_task(
+    health: paperless_health.TaskQueueHealth,
+    consumed_24h: int | None = None,
+    enriched_24h: int | None = None,
+) -> None:
+    metrics.push_paperless_health_metrics(
+        health.failed, health.oldest_unfinished_seconds, consumed_24h, enriched_24h
+    )
 
 
 @flow(name="paperless-health", log_prints=True)
 def paperless_health_flow() -> None:
-    """Two reads of the tasks API and a push (homelab#1589).
+    """Two reads of the tasks API and a push (homelab#1589), plus the digest's
+    24h consumed and enriched counts (homelab#2014).
 
     No concurrency slot and no retries, deliberately: a run that fails leaves
     `paperless_health_last_success_timestamp` where it was, and the
@@ -446,7 +478,8 @@ def paperless_health_flow() -> None:
     """
     logger = get_run_logger()
     health = probe_paperless_health_task()
-    push_paperless_health_metrics_task(health)
+    consumed, enriched = count_documents_24h_task()
+    push_paperless_health_metrics_task(health, consumed, enriched)
     logger.info(
         "paperless-health: %d unacknowledged failed consume task(s), oldest unfinished task %.0fs",
         health.failed, health.oldest_unfinished_seconds,

@@ -93,3 +93,22 @@ def _tasks(client: httpx.Client, paperless_url: str, page_size: int = 1, **param
     resp = client.get(f"{paperless_url}/api/tasks/", params={"page_size": page_size, **params})
     resp.raise_for_status()
     return resp.json()
+
+
+def documents_added_since(paperless_url: str, paperless_token: str, since: datetime.datetime) -> int:
+    """How many documents Paperless consumed at or after `since` (homelab#2014).
+
+    ``added`` is the consume time (``created`` is the document's own date), and
+    a page of one carries the total in ``count``. Needs the superuser token:
+    paperless applies object-level permissions, so a narrower token would
+    count only the documents it owns.
+    """
+    with httpx.Client(
+        headers={"Authorization": f"Token {paperless_token}"}, timeout=TIMEOUT
+    ) as client:
+        resp = client.get(
+            f"{paperless_url}/api/documents/",
+            params={"added__gte": since.isoformat(), "page_size": 1, "fields": "id"},
+        )
+        resp.raise_for_status()
+        return int(resp.json()["count"])

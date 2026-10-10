@@ -94,3 +94,28 @@ def test_a_successful_run_replaces_the_group_without_a_failure_timestamp(monkeyp
     query.assert_not_called()
     assert registry.get_sample_value("document_pipeline_emails_synced") == 3
     assert registry.get_sample_value("document_pipeline_last_failure_timestamp") is None
+
+
+def _pushed_health(monkeypatch, **counts):
+    monkeypatch.setenv("PUSHGATEWAY_URL", "http://pushgateway:9091")
+    with patch("document_pipeline.metrics.push_to_gateway") as push:
+        metrics.push_paperless_health_metrics(1, 30.0, **counts)
+    assert push.call_args.kwargs["job"] == "paperless-health"
+    return push.call_args.kwargs["registry"]
+
+
+def test_health_push_carries_the_24h_document_counts(monkeypatch):
+    registry = _pushed_health(monkeypatch, consumed_24h=5, enriched_24h=0)
+
+    assert registry.get_sample_value("paperless_tasks_failed") == 1
+    assert registry.get_sample_value("paperless_documents_consumed_24h") == 5
+    assert registry.get_sample_value("paperless_documents_enriched_24h") == 0
+
+
+def test_an_unreadable_count_is_left_out_rather_than_pushed_as_zero(monkeypatch):
+    """0 would read as a quiet day in the digest; absent reads as "not available"."""
+    registry = _pushed_health(monkeypatch)
+
+    assert registry.get_sample_value("paperless_tasks_failed") == 1
+    assert registry.get_sample_value("paperless_documents_consumed_24h") is None
+    assert registry.get_sample_value("paperless_documents_enriched_24h") is None
