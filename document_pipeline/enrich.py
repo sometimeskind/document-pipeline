@@ -652,13 +652,7 @@ def pick_created(proposed: str | None, document: dict, today: date) -> str | Non
     None as well when the answer already equals the current value: nothing to
     write, and no reason to rename the file.
     """
-    if not proposed or not _ISO_DATE.fullmatch(proposed):
-        return None
-    try:
-        candidate = date.fromisoformat(proposed)
-    except ValueError:
-        return None
-    if candidate > today:
+    if not _plausible_date(proposed, today):
         return None
     created = str(document.get("created") or "")[:10]
     added = str(document.get("added") or "")[:10]
@@ -667,6 +661,32 @@ def pick_created(proposed: str | None, document: dict, today: date) -> str | Non
     if proposed == created:
         return None
     return proposed
+
+
+def pick_redate(proposed: str | None, document: dict, today: date) -> str | None:
+    """pick_created without the `created == added` rule, for `redate` (#85).
+
+    The operator named these documents because paperless's own date is wrong,
+    so "paperless found a date" is no reason to keep it. Everything else holds:
+    a plain, real, non-future date, and None when it equals the current value —
+    which is also how a document that really is dated on that day (a birth
+    certificate) stays as it is.
+    """
+    if not _plausible_date(proposed, today):
+        return None
+    if proposed == str(document.get("created") or "")[:10]:
+        return None
+    return proposed
+
+
+def _plausible_date(proposed: str | None, today: date) -> bool:
+    """A plain, real YYYY-MM-DD that is not after `today`."""
+    if not proposed or not _ISO_DATE.fullmatch(proposed):
+        return False
+    try:
+        return date.fromisoformat(proposed) <= today
+    except ValueError:
+        return False
 
 
 def find_unenriched(
@@ -999,6 +1019,86 @@ def backfill_correspondent(
     patch_document(client, paperless_url, document_id, correspondent=correspondent_id)
     logger.info("Document %s assigned correspondent %r", document_id, name)
     result.duration_seconds = time.perf_counter() - started
+    return result
+
+
+def find_created_on(client: httpx.Client, paperless_url: str, day: str) -> list[int]:
+    """Ids of every document whose `created` is `day`, oldest first.
+
+    A gte/lte pair on the same day, because paperless has no plain `created=`
+    filter: it ignores the unknown parameter and returns the whole library.
+    Paged by number, like fetch_tag_vocabulary.
+    """
+    ids: list[int] = []
+    page = 1
+    while True:
+        resp = client.get(
+            f"{paperless_url}/api/documents/",
+            params={
+                "created__gte": day,
+                "created__lte": day,
+                "ordering": "id",
+                "fields": "id",
+                "page": page,
+                "page_size": 100,
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        ids.extend(int(r["id"]) for r in body.get("results") or [])
+        if not body.get("next"):
+            return ids
+        page += 1
+
+
+def redate_document(
+    client: httpx.Client,
+    paperless_url: str,
+    document_id: int,
+    *,
+    dry_run: bool = True,
+) -> EnrichResult:
+    """Re-ask one document's issue date and write `created` alone (#85).
+
+    For documents the operator picked because paperless's parser chose a wrong
+    date — a household birth date (homelab#1862) — which neither the sweep nor
+    pick_created will ever correct: the first skips a curated title, the second
+    keeps any date paperless found. One facts query; its correspondent and tags
+    are ignored, and the PATCH carries only `created`. Recorded like the other
+    writes (`pending`, then `redated`) so `rollback` can restore the old date.
+    """
+    started = time.perf_counter()
+    document = fetch_document(client, paperless_url, document_id)
+    content = document.get("content") or ""
+    if len(content.strip()) < MIN_CONTENT_CHARS:
+        return EnrichResult(
+            document_id=document_id,
+            outcome="skipped-short-content",
+            duration_seconds=time.perf_counter() - started,
+            **previous_state(document),
+        )
+
+    facts = extract_facts(content)
+    created = pick_redate(facts.created, document, date.today())
+    result = EnrichResult(
+        document_id=document_id,
+        outcome="dry-run" if created else "kept",
+        model_passes=1,
+        created=created,
+        created_proposed=facts.created,
+        **previous_state(document),
+    )
+    if created is None or dry_run:
+        result.duration_seconds = time.perf_counter() - started
+        return result
+
+    result.outcome = "redated"
+    append_result(replace(result, outcome=PENDING_OUTCOME))
+    patch_document(client, paperless_url, document_id, created=created)
+    logger.info("Document %s redated %s -> %s", document_id, result.previous_created, created)
+    result.duration_seconds = time.perf_counter() - started
+    # No task appends the outcome here, unlike the flows: this runs from the CLI.
+    append_result(result)
     return result
 
 

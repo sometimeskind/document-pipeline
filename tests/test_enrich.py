@@ -1536,3 +1536,116 @@ def test_count_enriched_since_counts_distinct_enriched_documents_in_the_window(t
 def test_count_enriched_since_is_zero_before_the_first_result(tmp_path):
     since = datetime.now(timezone.utc) - timedelta(hours=24)
     assert enrich.count_enriched_since(since, path=str(tmp_path / "missing.jsonl")) == 0
+
+
+# --- redate (#85): fix a wrong parser-picked created date ---
+
+
+def test_redate_replaces_a_date_paperless_found_itself():
+    """The rule pick_created refuses is the one redate exists for."""
+    doc = _doc(created="2025-03-14")
+    assert enrich.pick_created("2026-09-01", doc, TODAY) is None
+    assert enrich.pick_redate("2026-09-01", doc, TODAY) == "2026-09-01"
+
+
+def test_redate_keeps_a_date_the_model_confirms():
+    assert enrich.pick_redate("2025-03-14", _doc(created="2025-03-14"), TODAY) is None
+
+
+@pytest.mark.parametrize("raw", [None, "", "2026-02-30", "14.03.2025", "2026-09-26"])
+def test_redate_rejects_an_unusable_or_future_answer(raw):
+    assert enrich.pick_redate(raw, _doc(created="2025-03-14"), TODAY) is None
+
+
+def _mock_redate_document(*, content=_LONG_CONTENT, created="1990-01-31"):
+    """A document enrichment already titled, with a date paperless parsed."""
+    return respx.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").mock(
+        return_value=httpx.Response(200, json={
+            "id": DOC_ID, "title": "Polis zorgverzekering", "content": content,
+            "tags": [3], "original_file_name": "scan_0042.pdf", "correspondent": 8,
+            "created": created, "added": "2026-09-20T14:03:12+02:00",
+        })
+    )
+
+
+def _redate(*, dry_run):
+    with _client() as client:
+        return enrich.redate_document(client, PAPERLESS, DOC_ID, dry_run=dry_run)
+
+
+@respx.mock
+def test_redate_dry_run_reports_and_writes_nothing(monkeypatch, results_path):
+    _fallback_env(monkeypatch)
+    _mock_redate_document()
+    ollama = _mock_extraction(created="2026-09-01")
+    patch = _mock_patch()
+
+    result = _redate(dry_run=True)
+
+    assert (result.outcome, result.created, result.previous_created) == (
+        "dry-run", "2026-09-01", "1990-01-31",
+    )
+    assert _chat_schemas(ollama) == [["correspondent", "tags", "created"]]
+    assert not patch.called
+    assert _records(results_path) == []
+
+
+@respx.mock
+def test_redate_write_patches_only_created_and_records_it(monkeypatch, results_path):
+    _fallback_env(monkeypatch)
+    _mock_redate_document()
+    _mock_extraction(correspondent="Someone Else", tags=("Invoice",), created="2026-09-01")
+    patch = _mock_patch()
+
+    result = _redate(dry_run=False)
+
+    assert result.outcome == "redated"
+    assert json.loads(patch.calls.last.request.content) == {"created": "2026-09-01"}
+    records = _records(results_path)
+    assert [r["outcome"] for r in records] == [enrich.PENDING_OUTCOME, "redated"]
+    assert records[-1]["previous_created"] == "1990-01-31"
+    assert records[-1]["created"] == "2026-09-01"
+    assert records[-1]["title"] is None and records[-1]["correspondent_id"] is None
+
+
+@respx.mock
+def test_redate_leaves_the_document_alone_when_the_model_has_no_better_date(
+    monkeypatch, results_path,
+):
+    _fallback_env(monkeypatch)
+    _mock_redate_document()
+    _mock_extraction(created="1990-01-31")
+    patch = _mock_patch()
+
+    result = _redate(dry_run=False)
+
+    assert (result.outcome, result.created) == ("kept", None)
+    assert not patch.called
+    assert _records(results_path) == []
+
+
+@respx.mock
+def test_redate_skips_short_content_without_asking(monkeypatch):
+    _fallback_env(monkeypatch)
+    _mock_redate_document(content="")
+    ollama = _mock_extraction()
+
+    assert _redate(dry_run=False).outcome == "skipped-short-content"
+    assert not ollama.called
+
+
+@respx.mock
+def test_find_created_on_uses_a_same_day_range_and_follows_pages():
+    """No plain `created=` filter exists: paperless would return the whole library."""
+    route = respx.get(f"{PAPERLESS}/api/documents/").mock(side_effect=[
+        httpx.Response(200, json={"results": [{"id": 1}, {"id": 2}], "next": "http://x/?page=2"}),
+        httpx.Response(200, json={"results": [{"id": 3}], "next": None}),
+    ])
+
+    with _client() as client:
+        assert enrich.find_created_on(client, PAPERLESS, "1990-01-31") == [1, 2, 3]
+
+    params = route.calls[0].request.url.params
+    assert (params["created__gte"], params["created__lte"]) == ("1990-01-31", "1990-01-31")
+    assert "created" not in params
+    assert route.calls[1].request.url.params["page"] == "2"
