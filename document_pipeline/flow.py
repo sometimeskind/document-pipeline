@@ -427,7 +427,10 @@ def _run_backfill(batch_size: int, dry_run: bool, sample_ids: list[int] | None =
         raise RuntimeError(f"correspondent-backfill: all {failed} document(s) failed")
 
 
-@task(name="probe-paperless-health", log_prints=True)
+# Retries ride out a Paperless restart (it rolls with Recreate, so an upgrade
+# refuses connections for about a minute); the retries add 3 min, inside the
+# 5-min schedule, and a real outage still fails the run.
+@task(name="probe-paperless-health", retries=2, retry_delay_seconds=[60, 120], log_prints=True)
 def probe_paperless_health_task() -> paperless_health.TaskQueueHealth:
     return paperless_health.probe(os.environ["PAPERLESS_URL"], _paperless_admin_token())
 
