@@ -106,9 +106,71 @@ def _rollback(argv: list[str]) -> None:
         print("DRY RUN — nothing was written. Re-run with --write to apply.")
 
 
+def _redate(argv: list[str]) -> None:
+    """Re-ask the issue date of named documents and fix `created` (#85).
+
+    For dates paperless's parser picked wrongly (homelab#1862), which the
+    sweep never revisits. A subcommand because it is a one-off the operator
+    reviews: dry-run unless `--write`, and `rollback` undoes a write.
+
+        kubectl exec -n mail deploy/document-pipeline -- \\
+            python -m document_pipeline redate --created 2026-01-31 [--write]
+    """
+    import argparse
+
+    from document_pipeline import enrich
+
+    parser = argparse.ArgumentParser(
+        prog="python -m document_pipeline redate",
+        description="Re-ask the model for the created date of the named documents.",
+    )
+    parser.add_argument("ids", nargs="*", type=int, help="document ids")
+    parser.add_argument(
+        "--created", action="append", default=[], metavar="YYYY-MM-DD",
+        help="also every document whose created date is this day (repeatable)",
+    )
+    parser.add_argument("--write", action="store_true", help="apply; default is a dry run")
+    args = parser.parse_args(argv)
+    if not args.ids and not args.created:
+        parser.error("name at least one document id or --created date")
+
+    paperless_url = os.environ["PAPERLESS_URL"]
+    token = os.environ.get("PAPERLESS_ADMIN_TOKEN") or os.environ["PAPERLESS_API_TOKEN"]
+    with enrich.open_client(token) as client:
+        ids = list(args.ids)
+        for day in args.created:
+            ids.extend(enrich.find_created_on(client, paperless_url, day))
+        results = []
+        for i in dict.fromkeys(ids):
+            try:
+                results.append(
+                    enrich.redate_document(client, paperless_url, i, dry_run=not args.write)
+                )
+            except Exception as exc:
+                # One failed model or paperless call must not end the batch:
+                # report it and re-run with its id.
+                logger.error("Document %s failed: %s", i, exc)
+                results.append(enrich.EnrichResult(document_id=i, outcome="failed"))
+
+    for r in results:
+        current = str(r.previous_created or "")[:10] or "-"
+        print(f"{r.document_id:8d}  {r.outcome:21s}  {current} -> {r.created or 'unchanged'}"
+              f"  (model: {r.created_proposed or 'none'})  {r.previous_title or ''}")
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.outcome] = counts.get(r.outcome, 0) + 1
+    summary = ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items())) or "nothing to do"
+    print(f"{len(results)} document(s): {summary}")
+    if not args.write and counts.get("dry-run"):
+        print("DRY RUN — nothing was written. Re-run with --write to apply.")
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "vocab":
         _print_vocab()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "redate":
+        _redate(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "rollback":
         _rollback(sys.argv[2:])

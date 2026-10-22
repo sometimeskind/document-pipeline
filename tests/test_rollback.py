@@ -487,3 +487,26 @@ def test_cli_requires_since(monkeypatch):
     monkeypatch.setattr("sys.argv", ["document_pipeline", "rollback"])
     with pytest.raises(SystemExit):
         cli.main()
+
+
+@respx.mock
+def test_a_redated_record_restores_the_old_created_date():
+    """#85: a redate wrote only `created`; rollback puts the parser's date back."""
+    _mock_tags()
+    _mock_dated_document("2026-09-01")
+    patch = _mock_patch()
+    record = _record(
+        outcome="redated", title=None, matched_tags=[], correspondent=None,
+        previous_title="Invoice from Hermes", previous_tags=[3, 5], previous_correspondent=8,
+        tags=None, correspondent_id=None, created="2026-09-01", previous_created="1990-01-31",
+    )
+
+    [outcome] = _run({42: record}, write=True)
+
+    assert outcome.status == "reverted"
+    assert json.loads(patch.calls.last.request.content)["created"] == "1990-01-31"
+
+
+def test_redated_records_are_revertible(tmp_path):
+    path = _write(tmp_path, [_record(42, outcome="redated")])
+    assert sorted(rollback.load_latest(path, SINCE)) == [42]

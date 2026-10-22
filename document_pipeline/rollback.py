@@ -39,10 +39,11 @@ from document_pipeline.scan import resolve_tag
 
 logger = logging.getLogger(__name__)
 
-# The outcomes whose PATCH changed title or correspondent. `pending` is the
-# pre-PATCH record: if the task died before its outcome record, the PATCH may
-# or may not have landed, and the "edited since" check tells which.
-REVERTIBLE_OUTCOMES = frozenset({"enriched", "backfilled", enrich.PENDING_OUTCOME})
+# The outcomes whose PATCH changed title, correspondent or (`redated`, #85)
+# only `created`. `pending` is the pre-PATCH record: if the task died before
+# its outcome record, the PATCH may or may not have landed, and the "edited
+# since" check tells which.
+REVERTIBLE_OUTCOMES = frozenset({"enriched", "backfilled", "redated", enrich.PENDING_OUTCOME})
 
 
 @dataclass

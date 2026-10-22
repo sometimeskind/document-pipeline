@@ -385,6 +385,32 @@ they are unowned and harmless — and the file rename undoes itself: paperless
 re-renders the filename on the PATCH. Records from before this existed carry no
 `recorded_at` or before-state and are never matched.
 
+### Redate (#85)
+
+Neither the sweep nor the enrich rule ever corrects a `created` date that
+paperless's own parser picked: the sweep skips a curated title, and `pick_created`
+only writes over the consume-date fallback. When the parser picked a wrong date
+— a household birth date, homelab#1862 — `redate` re-asks the facts query for the
+named documents and writes `created` alone:
+
+```bash
+# Dry run: one line per document, current -> proposed, writes nothing
+kubectl exec -n mail deploy/document-pipeline -- \
+  python -m document_pipeline redate --created 1990-01-31 [--created ...] [1234 ...]
+# Apply
+kubectl exec -n mail deploy/document-pipeline -- \
+  python -m document_pipeline redate --created 1990-01-31 --write
+```
+
+`--created` selects every document dated that day (a same-day `created__gte`/`__lte`
+range: paperless silently ignores a plain `created=` and returns the whole library);
+bare ids add more. The answer is written only when it is a plain, real, non-future
+date that differs from the current one, so a document really dated that day (a
+birth certificate) is reported `kept`. Title, tags and correspondent are never
+touched. A write appends `pending` and `redated` records with `previous_created`,
+and `rollback --since` restores the old date. A failed document is reported
+`failed` and the rest carry on; re-run it by id.
+
 ### Migration from `ai-processed` (homelab#1561, done)
 
 Convergence used to be an `ai-processed` marker on every enriched document. The
