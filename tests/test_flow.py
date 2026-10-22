@@ -701,3 +701,30 @@ def test_paperless_health_flow_still_pushes_when_the_counts_fail(_health_env):
         paperless_health_flow()
 
     mock_metrics.push_paperless_health_metrics.assert_called_once_with(0, 0.0, None, None)
+
+
+def test_paperless_health_probe_rides_out_a_paperless_restart(_health_env):
+    """Paperless rolls with Recreate, so an upgrade or reboot refuses
+    connections for a minute; one refused probe must not fail the run
+    (homelab PrefectDeploymentFailing, 2026-10-22)."""
+    import httpx
+
+    from document_pipeline import flow as flow_mod
+    from document_pipeline.paperless_health import TaskQueueHealth
+
+    fast_probe = flow_mod.probe_paperless_health_task.with_options(retry_delay_seconds=0)
+    with patch.object(flow_mod, "probe_paperless_health_task", fast_probe), \
+         patch("document_pipeline.flow.paperless_health") as mock_probe, \
+         patch("document_pipeline.flow.enrich") as mock_enrich, \
+         patch("document_pipeline.flow.metrics") as mock_metrics:
+        mock_probe.probe.side_effect = [
+            httpx.ConnectError("[Errno 111] Connection refused"),
+            TaskQueueHealth(failed=0, oldest_unfinished_seconds=0.0),
+        ]
+        mock_probe.documents_added_since.return_value = 1
+        mock_enrich.count_enriched_since.return_value = 1
+
+        flow_mod.paperless_health_flow()
+
+    assert mock_probe.probe.call_count == 2
+    mock_metrics.push_paperless_health_metrics.assert_called_once_with(0, 0.0, 1, 1)
