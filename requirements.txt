@@ -1,4 +1,7 @@
 prefect==3.8.8
+# prefect 3.8.8's server passes Body(min_items=...), which fastapi 0.155.0 rejects;
+# prefect 3.9.0 drops it. Remove this cap with the prefect 3.9 bump.
+fastapi<0.155
 flask==3.1.3
 waitress==3.0.2
 httpx==0.28.1
