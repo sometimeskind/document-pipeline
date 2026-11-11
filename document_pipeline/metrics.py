@@ -28,7 +28,9 @@ def _prefect_failures_24h(prefect_url: str, flow_name: str) -> int | None:
             "state": {"type": {"any_": ["FAILED", "CRASHED"]}},
             "start_time": {"after_": cutoff},
         },
-        "flows": {"name": {"like_": f"%{flow_name}%"}},
+        # Exact name: like_ "%scan%" also matched music-pipeline's music-scan
+        # flow on the same Prefect server (#98).
+        "flows": {"name": {"any_": [flow_name]}},
         "limit": 200,
     }
 
