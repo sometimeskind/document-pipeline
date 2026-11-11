@@ -1259,7 +1259,7 @@ def test_backfill_rejects_a_correspondent_that_echoes_the_prompt(monkeypatch):
     """An echo is no issuer: marked declined, never created."""
     _fallback_env(monkeypatch)
     _mock_document(tags=(3,))
-    _mock_ollama("Name the organization or person that issued or sent this document")
+    _mock_ollama("Name the company, authority or person that sent this document")
     create = _mock_correspondent_create()
     patch = _mock_patch()
 
