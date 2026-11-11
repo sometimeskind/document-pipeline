@@ -119,3 +119,13 @@ def test_an_unreadable_count_is_left_out_rather_than_pushed_as_zero(monkeypatch)
     assert registry.get_sample_value("paperless_tasks_failed") == 1
     assert registry.get_sample_value("paperless_documents_consumed_24h") is None
     assert registry.get_sample_value("paperless_documents_enriched_24h") is None
+
+
+def test_failure_count_matches_the_flow_name_exactly():
+    """A substring match also counted music-pipeline's `music-scan` runs on the
+    same Prefect server, paging ScanPipelineFailing for music imports (#98)."""
+    with patch("document_pipeline.metrics.httpx.post") as post:
+        post.return_value.json.return_value = []
+        assert metrics._prefect_failures_24h("http://prefect/api", flow_name="scan") == 0
+
+    assert post.call_args.kwargs["json"]["flows"] == {"name": {"any_": ["scan"]}}
